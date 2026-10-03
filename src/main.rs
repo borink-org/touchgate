@@ -121,11 +121,6 @@ fn prepare(version: &str, args: &[&str]) -> Result<(), Vec<String>> {
 /// with its section of the changelog as the notes.
 fn github_release(commit: &str) -> Result<(), Vec<String>> {
     let version = check()?;
-    let workspace = Workspace::load()?;
-    let text = read(&changelog_path(&workspace))?;
-    let notes = Changelog::parse(&text)?
-        .notes(&version)
-        .ok_or_else(|| vec![format!("CHANGELOG.md: no section for {version}")])?;
     let head = run(Command::new("git").args(["rev-parse", "--verify", "HEAD^{commit}"]))?;
     if head.trim_end() != commit {
         return Err(vec![format!(
@@ -133,7 +128,15 @@ fn github_release(commit: &str) -> Result<(), Vec<String>> {
             head.trim_end()
         )]);
     }
-    github::release(commit, &version, &notes).map_err(|error| vec![error])
+    let workspace = Workspace::load()?;
+    let top =
+        PathBuf::from(run(Command::new("git").args(["rev-parse", "--show-toplevel"]))?.trim_end());
+    let path = changelog_path(&workspace);
+    let relative = path.strip_prefix(&top).unwrap_or(&path);
+    let relative = relative
+        .to_str()
+        .ok_or_else(|| vec![format!("{} is not a UTF-8 path", relative.display())])?;
+    github::release(commit, &version, relative).map_err(|error| vec![error])
 }
 
 /// Fails if the changes since `base` touch a published package but add

@@ -88,13 +88,15 @@ Merge with a merge commit, never by squashing or rebasing, which would drop the 
     Ok(())
 }
 
-/// Tags `commit` as `version` and makes its GitHub release, with `notes`.
+/// Tags `commit` as `v<version>` and makes its GitHub release, titled with
+/// the tag and pointing at `changelog`, the changelog's path in the
+/// repository, as it reads at the tag.
 ///
 /// Anyone who can push can make tags and releases, so a tag or a release that
 /// exists already must point at `commit`, or this fails rather than dress up
 /// someone else's. A release this made before, on a run that failed later,
 /// counts as done.
-pub fn release(commit: &str, version: &Version, notes: &str) -> Result<(), String> {
+pub fn release(commit: &str, version: &Version, changelog: &str) -> Result<(), String> {
     if !approval::is_hash(commit) {
         return Err(format!("`{commit}` is not a full commit hash"));
     }
@@ -124,29 +126,16 @@ pub fn release(commit: &str, version: &Version, notes: &str) -> Result<(), Strin
         Err(error) => return Err(error),
     }
 
-    let notes_path = std::env::temp_dir().join(format!("touchgate-notes-{}", std::process::id()));
-    std::fs::write(&notes_path, notes).map_err(|error| error.to_string())?;
-    let notes_arg = notes_path
-        .to_str()
-        .ok_or("the temporary directory is not a UTF-8 path")?;
-    let title = version.to_string();
+    let url = gh(&["repo", "view", "--json", "url", "--jq", ".url"])?;
+    let name = changelog.rsplit('/').next().unwrap_or(changelog);
+    let notes = format!("See [{name}]({}/blob/{tag}/{changelog}).", url.trim_end());
     let mut args = vec![
-        "release",
-        "create",
-        &tag,
-        "--target",
-        commit,
-        "--title",
-        &title,
-        "--notes-file",
-        notes_arg,
+        "release", "create", &tag, "--target", commit, "--title", &tag, "--notes", &notes,
     ];
     if version.is_pre_release() {
         args.push("--prerelease");
     }
-    let created = gh(&args);
-    let _ = std::fs::remove_file(&notes_path);
-    created?;
+    gh(&args)?;
 
     match tagged_commit(&tag)? {
         Some(tagged) if tagged == commit => Ok(()),
