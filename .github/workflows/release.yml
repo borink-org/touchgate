@@ -1,43 +1,60 @@
-# Publishes a release once its approval checks out, then tags it and makes a
-# GitHub release.
+# The release, as a reusable workflow: checks the approval, publishes to
+# crates.io, then tags the release and makes a GitHub release.
 #
-# The copy of this file on the `publish` branch is the one that runs, and the
-# only one crates.io accepts: the `release` environment admits that branch
-# alone, and a ruleset lets no one but an administrator push to it. The copy on
-# the default branch exists because GitHub dispatches a workflow only if the
-# default branch has it. Keep the two the same.
-#
-# Replace the three values under `env`, then see the touchgate README for the
-# repository and crates.io settings this depends on.
+# A repository calls this from its own `.github/workflows/release.yml` on the
+# `publish` branch, pinned to a touchgate commit; the README shows the file.
+# crates.io matches the caller's file, so that is the file its trusted
+# publisher names, with the `release` environment of the publish job here.
 
 name: release
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       commit:
         description: The merge commit of the release, on the default branch
         required: true
         type: string
+      key:
+        description: The public key that approves a release, as ssh-keygen writes it
+        required: true
+        type: string
 
 permissions: {}
 
-concurrency:
-  group: release
-  cancel-in-progress: false
-
 env:
-  # The one key that approves a release, as `ssh-keygen` writes a public key.
-  # It is kept here, where only the `publish` branch can change it.
-  RELEASE_KEY: "sk-ssh-ed25519@openssh.com AAAA... replace with the public key"
-  # The touchgate commit that checks the approval. A commit rather than a tag,
-  # so that what checks the approval cannot change without this file. Moving
-  # it trusts the new code, so read the change first.
-  TOUCHGATE_REV: replace-with-a-touchgate-commit
-  DEFAULT_BRANCH: main
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The touchgate commit this workflow was called at. GitHub's contexts all
+  # describe the caller, so the commit comes from the `job_workflow_sha` claim
+  # of an OIDC token. That token is for another audience and carries no
+  # environment, so crates.io would refuse it, and this job runs nothing but
+  # the request.
+  locate:
+    name: Find this touchgate commit
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # to read job_workflow_sha from an OIDC token
+    outputs:
+      sha: ${{ steps.locate.outputs.sha }}
+    steps:
+      - id: locate
+        name: Read the commit from an OIDC token
+        run: |
+          set -euo pipefail
+          token=$(curl --silent --show-error --fail \
+            --header "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=touchgate" | jq -r .value)
+          payload=$(cut -d. -f2 <<< "$token" | tr '_-' '/+')
+          while (( ${#payload} % 4 )); do payload+="="; done
+          sha=$(base64 --decode <<< "$payload" | jq -r .job_workflow_sha)
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::job_workflow_sha is '$sha'"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
   # Checks the approval without running anything from the commit, because
   # until this passes the commit is untrusted: a `rust-toolchain.toml`, a
   # `.cargo/config.toml` or a build script in it could make the check pass.
@@ -45,11 +62,15 @@ jobs:
   # toolchain, and reads the commit with git alone.
   verify:
     name: Check the approval
+    needs: locate
     runs-on: ubuntu-latest
     permissions:
       contents: read # to fetch the default branch
     outputs:
       touchgate-sha256: ${{ steps.digest.outputs.sha256 }}
+    env:
+      TOUCHGATE_REV: ${{ needs.locate.outputs.sha }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
       - name: Refuse to run from any branch but publish
         run: |
@@ -72,10 +93,11 @@ jobs:
         working-directory: ${{ runner.temp }}
         env:
           COMMIT: ${{ inputs.commit }}
+          KEY: ${{ inputs.key }}
         run: |
           "$RUNNER_TEMP/touchgate/bin/touchgate" verify \
             --repo "$GITHUB_WORKSPACE/repository" --commit "$COMMIT" \
-            --branch "origin/$DEFAULT_BRANCH" --key "$RELEASE_KEY"
+            --branch "origin/$DEFAULT_BRANCH" --key "$KEY"
       # Later jobs run this binary only if it still has this digest. A job's
       # outputs cannot change once it ends, but a step in a later job can
       # replace the artifact, and the build job runs every dependency's build
@@ -119,10 +141,9 @@ jobs:
           echo "$SHA256  $RUNNER_TEMP/touchgate/touchgate" | sha256sum --check --strict
           chmod +x "$RUNNER_TEMP/touchgate/touchgate"
           echo "$RUNNER_TEMP/touchgate" >> "$GITHUB_PATH"
-      # rustup installs what `rust-toolchain.toml` pins. Without that file the
-      # runner's stable toolchain is used, and this step can go.
+      # Installs what `rust-toolchain.toml` pins, if the repository has one.
       - name: Install the pinned Rust toolchain
-        run: rustup toolchain install
+        run: if [ -e rust-toolchain.toml ] || [ -e rust-toolchain ]; then rustup toolchain install; fi
       # touchgate prints only a version it parsed, so the output cannot carry
       # anything else.
       - name: Check the changelog and the versions
@@ -137,6 +158,9 @@ jobs:
     needs: [verify, build]
     runs-on: ubuntu-latest
     environment: release
+    concurrency:
+      group: touchgate-publish
+      cancel-in-progress: false
     permissions:
       contents: read # to check out the release
       id-token: write # for crates.io trusted publishing
@@ -157,7 +181,7 @@ jobs:
           chmod +x "$RUNNER_TEMP/touchgate/touchgate"
           echo "$RUNNER_TEMP/touchgate" >> "$GITHUB_PATH"
       - name: Install the pinned Rust toolchain
-        run: rustup toolchain install
+        run: if [ -e rust-toolchain.toml ] || [ -e rust-toolchain ]; then rustup toolchain install; fi
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
       # Skips what is on crates.io already, so a release that failed halfway
@@ -198,7 +222,7 @@ jobs:
           chmod +x "$RUNNER_TEMP/touchgate/touchgate"
           echo "$RUNNER_TEMP/touchgate" >> "$GITHUB_PATH"
       - name: Install the pinned Rust toolchain
-        run: rustup toolchain install
+        run: if [ -e rust-toolchain.toml ] || [ -e rust-toolchain ]; then rustup toolchain install; fi
       - name: Tag the release and make a GitHub release
         run: |
           set -euo pipefail

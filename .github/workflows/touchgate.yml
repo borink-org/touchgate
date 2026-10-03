@@ -1,0 +1,183 @@
+# Everything but the release itself, as a reusable workflow. Nothing here is
+# trusted: `release.yml` checks the approval on its own.
+#
+# - Started by hand with a version, prepares the release: dates `## Unreleased`
+#   in the changelog, sets the version on every published package, and opens
+#   a pull request.
+# - On a push to the default branch and on a pull request, checks the
+#   changelog, and that a pull request that changes a published package says
+#   so under `## Unreleased`, unless it is labelled `no-changelog`.
+# - On a push to the default branch that merges an approval, starts
+#   `release.yml` on the `publish` branch.
+#
+# A repository calls this from `.github/workflows/touchgate.yml`; the README
+# shows the file.
+
+name: touchgate
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: The version to prepare, when started by hand
+        required: false
+        type: string
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The touchgate commit this workflow was called at; see `release.yml`. A
+  # pull request from a fork gets no OIDC token, so it gets no commit, and the
+  # jobs that build touchgate skip it. The push that merges it checks it.
+  locate:
+    name: Find this touchgate commit
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # to read job_workflow_sha from an OIDC token
+    outputs:
+      sha: ${{ steps.locate.outputs.sha }}
+    steps:
+      - id: locate
+        name: Read the commit from an OIDC token
+        run: |
+          set -euo pipefail
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "No OIDC token for this event"
+            exit 0
+          fi
+          token=$(curl --silent --show-error --fail \
+            --header "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=touchgate" | jq -r .value)
+          payload=$(cut -d. -f2 <<< "$token" | tr '_-' '/+')
+          while (( ${#payload} % 4 )); do payload+="="; done
+          sha=$(base64 --decode <<< "$payload" | jq -r .job_workflow_sha)
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::job_workflow_sha is '$sha'"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  prepare:
+    name: Prepare the release
+    needs: locate
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && github.ref_name == github.event.repository.default_branch
+      && needs.locate.outputs.sha != ''
+    runs-on: ubuntu-latest
+    concurrency:
+      group: touchgate-prepare
+      cancel-in-progress: false
+    permissions:
+      contents: write # to push the release branch
+      pull-requests: write # to open the pull request
+    env:
+      TOUCHGATE_REV: ${{ needs.locate.outputs.sha }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      # The credentials stay, to push the release branch. They can do no more
+      # than anyone who can start this workflow.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 # zizmor: ignore[artipacked]
+      - name: Install the pinned Rust toolchain
+        run: if [ -e rust-toolchain.toml ] || [ -e rust-toolchain ]; then rustup toolchain install; fi
+      - name: Build touchgate
+        working-directory: ${{ runner.temp }}
+        run: |
+          cargo install --locked --root "$RUNNER_TEMP/touchgate" \
+            --git https://github.com/borink-org/touchgate --rev "$TOUCHGATE_REV" touchgate
+          echo "$RUNNER_TEMP/touchgate/bin" >> "$GITHUB_PATH"
+      - name: Prepare the release
+        run: touchgate prepare "$VERSION"
+      - name: Open the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch="release/$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch --create "$branch"
+          git commit --all --message "Prepare the $VERSION release."
+          git push --force origin "$branch"
+          cat > "$RUNNER_TEMP/body.md" <<EOF
+          This sets every published package to $VERSION and dates its section of the changelog.
+
+          To approve the release, check out this branch, look it over, and once the checks pass run \`touchgate approve\`. It signs an empty commit with the release key, which asks for its PIN and a touch, and pushes it.
+
+          \`\`\`
+          git fetch origin
+          git switch $branch
+          touchgate approve
+          \`\`\`
+
+          Pushing the approval also starts this pull request's checks, which a pull request opened by a workflow does not start on its own. An approval lasts an hour, so merge once they pass; if the hour runs out, approve again.
+
+          Merge with a merge commit, never by squashing or rebasing, which would drop the signature. The release then publishes to crates.io, and tags and releases $VERSION on GitHub once that succeeds. If the default branch moves before the merge, merge it into this branch and approve again, since a release publishes only the exact tree that was approved.
+          EOF
+          gh pr create --head "$branch" --title "Release $VERSION." --body-file "$RUNNER_TEMP/body.md" \
+            || gh pr edit "$branch" --body-file "$RUNNER_TEMP/body.md"
+
+  changelog:
+    name: Check the changelog
+    needs: locate
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'pull_request')
+      && needs.locate.outputs.sha != ''
+    runs-on: ubuntu-latest
+    concurrency:
+      group: touchgate-changelog-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read # to check out the history
+    env:
+      TOUCHGATE_REV: ${{ needs.locate.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: if [ -e rust-toolchain.toml ] || [ -e rust-toolchain ]; then rustup toolchain install; fi
+      - name: Build touchgate
+        working-directory: ${{ runner.temp }}
+        run: |
+          cargo install --locked --root "$RUNNER_TEMP/touchgate" \
+            --git https://github.com/borink-org/touchgate --rev "$TOUCHGATE_REV" touchgate
+          echo "$RUNNER_TEMP/touchgate/bin" >> "$GITHUB_PATH"
+      - name: Check the changelog and the versions
+        run: touchgate check
+      - name: Check for a changelog entry
+        if: >-
+          github.event_name == 'pull_request'
+          && !contains(github.event.pull_request.labels.*.name, 'no-changelog')
+          && !startsWith(github.head_ref, 'release/')
+        env:
+          BASE: origin/${{ github.base_ref }}
+        run: touchgate check-entry "$BASE"
+
+  start:
+    name: Start the release
+    if: >-
+      github.event_name == 'push'
+      && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # to read the merge
+      actions: write # to start release.yml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Start the release if this merge brings in an approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          subject=$(git log -1 --format=%s HEAD^2 2> /dev/null || true)
+          if [[ "$subject" != "Approve release"* ]]; then
+            echo "No approval in this push"
+            exit 0
+          fi
+          gh workflow run release.yml --ref publish -f commit="$GITHUB_SHA"

@@ -28,4 +28,54 @@ ssh-keygen -t ed25519-sk -O resident -O verify-required -O application=ssh:signi
 cargo install --locked --git https://github.com/borink-org/touchgate
 ```
 
-Copy `workflows/` into `.github/workflows/`, set `TOUCHGATE_REV`, the default branch and, in `release.yml`, `RELEASE_KEY`. Commit `release.yml` to both the default branch and `publish`.
+Add two workflows that call touchgate's, pinned to a touchgate commit. `.github/workflows/touchgate.yml`, with your default branch:
+
+```yaml
+name: touchgate
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The version to release, such as 0.4.0
+        required: true
+        type: string
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+permissions: {}
+jobs:
+  touchgate:
+    uses: borink-org/touchgate/.github/workflows/touchgate.yml@<commit>
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+      id-token: write
+    with:
+      version: ${{ inputs.version }}
+```
+
+`.github/workflows/release.yml`, with the contents of your `.pub` file, committed to both the default branch and `publish`:
+
+```yaml
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        required: true
+        type: string
+permissions: {}
+jobs:
+  release:
+    uses: borink-org/touchgate/.github/workflows/release.yml@<commit>
+    permissions:
+      contents: write
+      id-token: write
+    with:
+      commit: ${{ inputs.commit }}
+      key: sk-ssh-ed25519@openssh.com AAAA...
+```
+
+Allow GitHub Actions to create pull requests, and add a `no-changelog` label for pull requests with nothing to say in the changelog.
