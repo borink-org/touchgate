@@ -16,6 +16,11 @@ use sha2::{Digest, Sha256, Sha512};
 const SK: &str = "sk-ssh-ed25519@openssh.com";
 const APPLICATION: &str = "ssh:signing";
 const PRESENT_AND_VERIFIED: u8 = 0x05;
+/// The commit of the publish branch the test releases run from.
+const WORKFLOW: &str = "1111111111111111111111111111111111111111";
+/// An approval as `touchgate approve` writes it.
+const MESSAGE: &str =
+    "Approve release 0.1.0.\n\nRelease-Workflow: 1111111111111111111111111111111111111111\n";
 
 #[test]
 fn accepts_an_approval_made_with_touch_and_pin() {
@@ -62,7 +67,7 @@ fn refuses_a_silent_approval_that_git_accepts() {
 
 #[test]
 fn refuses_flags_changed_after_signing() {
-    let release = Release::build(0x00, PRESENT_AND_VERIFIED, false, 0);
+    let release = Release::build(0x00, PRESENT_AND_VERIFIED, false, 0, MESSAGE);
     let output = release.verify();
     assert!(
         stderr(&output).contains("is invalid"),
@@ -73,7 +78,8 @@ fn refuses_flags_changed_after_signing() {
 
 #[test]
 fn refuses_a_merge_that_brings_in_unapproved_changes() {
-    let output = Release::build(PRESENT_AND_VERIFIED, PRESENT_AND_VERIFIED, true, 0).verify();
+    let output =
+        Release::build(PRESENT_AND_VERIFIED, PRESENT_AND_VERIFIED, true, 0, MESSAGE).verify();
     assert!(
         stderr(&output).contains("another tree"),
         "{}",
@@ -96,7 +102,13 @@ fn refuses_another_key() {
 #[test]
 fn refuses_a_stale_approval() {
     let two_hours = 2 * 3_600;
-    let release = Release::build(PRESENT_AND_VERIFIED, PRESENT_AND_VERIFIED, false, two_hours);
+    let release = Release::build(
+        PRESENT_AND_VERIFIED,
+        PRESENT_AND_VERIFIED,
+        false,
+        two_hours,
+        MESSAGE,
+    );
     let output = release.verify();
     let expected = "2 hours old, older than the 60 minutes an approval lasts";
     assert!(stderr(&output).contains(expected), "{}", stderr(&output));
@@ -112,6 +124,7 @@ fn refuses_a_stale_approval() {
             "--key",
             &release.key,
         ])
+        .args(["--workflow-commit", WORKFLOW])
         .args(["--max-age", "3h"])
         .output()
         .unwrap();
@@ -147,6 +160,7 @@ fn ignores_replacement_objects() {
             "--key",
             &release.key,
         ])
+        .args(["--workflow-commit", WORKFLOW])
         .output()
         .unwrap();
     assert!(
@@ -154,6 +168,46 @@ fn ignores_replacement_objects() {
         "{}",
         stderr(&output)
     );
+}
+
+#[test]
+fn refuses_a_release_from_a_changed_publish_branch() {
+    let release = Release::new(PRESENT_AND_VERIFIED);
+    let output = Command::new(env!("CARGO_BIN_EXE_touchgate"))
+        .args(["verify", "--repo"])
+        .arg(&release.dir)
+        .args([
+            "--commit",
+            &release.merge,
+            "--branch",
+            "main",
+            "--key",
+            &release.key,
+        ])
+        .args([
+            "--workflow-commit",
+            "2222222222222222222222222222222222222222",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&output).contains("publish branch changed"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn refuses_an_approval_that_names_no_publish_commit() {
+    let release = Release::build(
+        PRESENT_AND_VERIFIED,
+        PRESENT_AND_VERIFIED,
+        false,
+        0,
+        "Approve release 0.1.0.\n",
+    );
+    let output = release.verify();
+    assert!(stderr(&output).contains("no single"), "{}", stderr(&output));
 }
 
 /// A repository whose `main` ends in the merge of a signed approval.
@@ -168,13 +222,13 @@ struct Release {
 
 impl Release {
     fn new(flags: u8) -> Self {
-        Self::build(flags, flags, false, 0)
+        Self::build(flags, flags, false, 0, MESSAGE)
     }
 
     /// Signs the approval with `flags`, and writes `claimed` as its flags.
     /// With `moved`, `main` gains a commit before the merge. The approval is
     /// dated `age` seconds ago.
-    fn build(flags: u8, claimed: u8, moved: bool, age: u64) -> Self {
+    fn build(flags: u8, claimed: u8, moved: bool, age: u64, message: &str) -> Self {
         // Tests run in parallel, so each repository gets a directory of its own.
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -212,7 +266,7 @@ impl Release {
             .as_secs();
         let identity = format!("T <t@example.com> {} +0000", now - age);
         let unsigned = format!(
-            "tree {tree}\nparent {prepared}\nauthor {identity}\ncommitter {identity}\n\nApprove release 0.1.0.\n"
+            "tree {tree}\nparent {prepared}\nauthor {identity}\ncommitter {identity}\n\n{message}"
         );
         let armored = sign(&signing_key, unsigned.as_bytes(), flags, claimed);
         let signed = unsigned.replacen(
@@ -260,6 +314,7 @@ impl Release {
             .args(["verify", "--repo"])
             .arg(&self.dir)
             .args(["--commit", &self.merge, "--branch", "main", "--key", key])
+            .args(["--workflow-commit", WORKFLOW])
             .output()
             .unwrap()
     }

@@ -29,6 +29,7 @@ usage:
   touchgate check-entry <base revision>
   touchgate notes [<version>]
   touchgate verify --repo <dir> --commit <hash> --branch <ref> --key <public key>
+                   --workflow-commit <hash>
                    [--max-age <30m | 1h | 7d>]
   touchgate publish [<cargo publish arguments>...]
   touchgate approve [--key <private key>] [--no-push]
@@ -210,7 +211,8 @@ fn notes(version: Option<&str>) -> Result<(), Vec<String>> {
 /// Checks a release's approval with [`approval::verify`], and prints the
 /// approval commit. Reads no workspace, since the tree is not trusted yet.
 fn verify(args: &[&str]) -> Result<(), Vec<String>> {
-    let (mut repo, mut commit, mut branch, mut key, mut max_age) = (None, None, None, None, None);
+    let (mut repo, mut commit, mut branch, mut key, mut workflow, mut max_age) =
+        (None, None, None, None, None, None);
     let mut args = args.iter();
     while let Some(flag) = args.next() {
         let slot = match *flag {
@@ -218,17 +220,23 @@ fn verify(args: &[&str]) -> Result<(), Vec<String>> {
             "--commit" => &mut commit,
             "--branch" => &mut branch,
             "--key" => &mut key,
+            "--workflow-commit" => &mut workflow,
             "--max-age" => &mut max_age,
             _ => return Err(vec![USAGE.to_owned()]),
         };
         *slot = Some(*args.next().ok_or_else(|| vec![USAGE.to_owned()])?);
     }
-    let (Some(repo), Some(commit), Some(branch), Some(key)) = (repo, commit, branch, key) else {
+    let (Some(repo), Some(commit), Some(branch), Some(key), Some(workflow)) =
+        (repo, commit, branch, key, workflow)
+    else {
         return Err(vec![USAGE.to_owned()]);
     };
+    if !approval::is_hash(workflow) {
+        return Err(vec![format!("`{workflow}` is not a full commit hash")]);
+    }
     let max_age =
         approval::parse_age(max_age.unwrap_or(DEFAULT_MAX_AGE)).map_err(|error| vec![error])?;
-    let approval = approval::verify(Path::new(repo), commit, key, branch, max_age)
+    let approval = approval::verify(Path::new(repo), commit, key, branch, workflow, max_age)
         .map_err(|error| vec![error])?;
     println!("{approval}");
     Ok(())
@@ -297,8 +305,23 @@ fn approve(args: &[&str]) -> Result<(), Vec<String>> {
         )]);
     }
 
+    // The release is to run from publish as it is now; a change to it after
+    // this stops the release until it is approved again.
+    run(Command::new("git").args([
+        "fetch",
+        "--quiet",
+        "origin",
+        "+refs/heads/publish:refs/remotes/origin/publish",
+    ]))?;
+    let publish = run(Command::new("git").args([
+        "rev-parse",
+        "--verify",
+        "refs/remotes/origin/publish^{commit}",
+    ]))?;
+    let publish = publish.trim_end();
+
     println!(
-        "Approving release {version} at {}. The key asks for its PIN and a touch.",
+        "Approving release {version} at {}, to run from publish at {publish}. The key asks for its PIN and a touch.",
         head.trim_end()
     );
     let status = Command::new("git")
@@ -312,7 +335,9 @@ fn approve(args: &[&str]) -> Result<(), Vec<String>> {
             "--gpg-sign",
             "--message",
         ])
-        .arg(format!("Approve release {version}."))
+        .arg(format!("{} {version}.", approval::APPROVAL))
+        .arg("--message")
+        .arg(format!("{}: {publish}", approval::WORKFLOW_TRAILER))
         .status()
         .map_err(|error| vec![format!("git: {error}")])?;
     if !status.success() {

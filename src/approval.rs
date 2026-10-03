@@ -21,6 +21,13 @@
 //! `refs/replace/` ref would make git answer for one commit with another, and
 //! so are the user's and the system's git configuration.
 //!
+//! The approval also names, in a `Release-Workflow` trailer, the commit of
+//! the `publish` branch it expects the release to run from. A change to that
+//! branch after the approval then stops the release until it is approved
+//! again. This catches a change made in good faith that the approver did not
+//! know of. It cannot stop a change made to get around it, since such a change
+//! can remove this check too; only the ruleset on `publish` does that.
+//!
 //! An approval expires: its committer time, which the signature covers, must
 //! be recent. Otherwise an approval of a tree that was later abandoned, say
 //! for a bug found after approving, could be merged and released by anyone
@@ -42,6 +49,10 @@ const NAMESPACE: &str = "git";
 /// How the subject of an approval starts.
 pub const APPROVAL: &str = "Approve release";
 
+/// The trailer of an approval that names the commit of the `publish` branch
+/// the release is to run from.
+pub const WORKFLOW_TRAILER: &str = "Release-Workflow";
+
 /// The principal the one allowed key is listed under. Only this module reads
 /// the allowed-signers file, so the name is arbitrary.
 const PRINCIPAL: &str = "touchgate";
@@ -54,12 +65,15 @@ const CLOCK_SKEW_SECONDS: i64 = 300;
 /// approved at most `max_age_seconds` ago, and returns the approval commit.
 /// `key` is a public key as `ssh-keygen` writes it,
 /// `sk-ssh-ed25519@openssh.com AAAA... comment`. `branch` is the ref the
-/// release must be on, such as `origin/main`.
+/// release must be on, such as `origin/main`. `workflow_commit` is the commit
+/// of the `publish` branch this run's release workflow comes from, which the
+/// approval must name.
 pub fn verify(
     repo: &Path,
     commit: &str,
     key: &str,
     branch: &str,
+    workflow_commit: &str,
     max_age_seconds: i64,
 ) -> Result<String, String> {
     let (key_type, key_blob) = parse_public_key(key)?;
@@ -134,6 +148,31 @@ pub fn verify(
 
     ssh_keygen_verify(key_type, key, &payload, &armored)
         .map_err(|error| format!("the signature of the approval {approval} is invalid: {error}"))?;
+
+    // Only now are the trailer and the committer time known to be the
+    // signer's.
+    let prefix = format!("{WORKFLOW_TRAILER}: ");
+    let named: Vec<&str> = approved
+        .message
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix))
+        .collect();
+    match named[..] {
+        [named] if named == workflow_commit => {}
+        [named] => {
+            return Err(format!(
+                "the approval {approval} expects the release to run from publish at {named}, \
+                 but this run comes from {workflow_commit}. The publish branch changed after the \
+                 approval: check the change, then approve again"
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "the approval {approval} has no single `{WORKFLOW_TRAILER}` trailer naming the \
+                 publish commit. Approve with `touchgate approve`"
+            ));
+        }
+    }
 
     // Only now is the committer time known to be the signer's.
     let now = SystemTime::now()
@@ -254,6 +293,7 @@ struct RawCommit {
     committer_time: i64,
     /// The first line of the message.
     subject: String,
+    message: String,
 }
 
 impl RawCommit {
@@ -301,6 +341,7 @@ impl RawCommit {
             parents,
             committer_time: committer_time.ok_or_else(malformed)?,
             subject: message.lines().next().unwrap_or_default().to_owned(),
+            message: message.to_owned(),
             raw,
         })
     }

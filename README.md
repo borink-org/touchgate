@@ -10,7 +10,7 @@ Releases a Cargo workspace from a hand-written `CHANGELOG.md`, and lets CI publi
 
 ## What it checks
 
-The merge's second parent must be the approval: same tree as the merge, at most an hour old, signed by the one key in `release.yml`, with the signature's flags showing a touch and the PIN. git and `ssh-keygen` accept FIDO2 signatures made without either, so touchgate reads those flags itself. It runs no code from the commit it checks.
+The merge's second parent must be the approval: same tree as the merge, at most an hour old, signed by the one key in `release.yml`, with the signature's flags showing a touch and the PIN, and naming the `publish` commit the release runs from, so a change to `publish` after you approve stops the release. git and `ssh-keygen` accept FIDO2 signatures made without either, so touchgate reads those flags itself. It runs no code from the commit it checks.
 
 ## What it relies on
 

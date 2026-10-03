@@ -60,9 +60,11 @@ jobs:
           COMMIT: ${{ inputs.commit }}
           KEY: ${{ inputs.key }}
           BRANCH: origin/${{ github.event.repository.default_branch }}
+          # The commit of the caller's workflow: publish as this run uses it.
+          WORKFLOW_COMMIT: ${{ github.workflow_sha }}
         run: >-
           "$RUNNER_TEMP/touchgate/bin/touchgate" verify --repo "$GITHUB_WORKSPACE/repository"
-          --commit "$COMMIT" --branch "$BRANCH" --key "$KEY"
+          --commit "$COMMIT" --branch "$BRANCH" --key "$KEY" --workflow-commit "$WORKFLOW_COMMIT"
       # Later jobs run this binary only if it still has this digest. A job's
       # outputs cannot change once it ends, but a step in a later job can
       # replace the artifact, and the build job runs every dependency's build

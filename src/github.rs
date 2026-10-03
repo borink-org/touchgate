@@ -118,7 +118,7 @@ git switch {branch}
 touchgate approve
 ```
 
-Pushing the approval also starts this pull request's checks, which a pull request opened by a workflow does not start on its own. An approval lasts an hour, so merge once they pass; if the hour runs out, approve again.
+The approval names the commit of the `publish` branch the release is to run from; if that branch changes before the release, approve again. Pushing the approval also starts this pull request's checks, which a pull request opened by a workflow does not start on its own. An approval lasts an hour, so merge once they pass; if the hour runs out, approve again.
 
 Merge with a merge commit, never by squashing or rebasing, which would drop the signature. The release then publishes to crates.io, and tags and releases {version} on GitHub once that succeeds. If the default branch moves before the merge, merge it into this branch and approve again, since a release publishes only the exact tree that was approved.
 
