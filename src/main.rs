@@ -324,7 +324,12 @@ fn approve(args: &[&str]) -> Result<(), Vec<String>> {
         "Approving release {version} at {}, to run from publish at {publish}. The key asks for its PIN and a touch.",
         head.trim_end()
     );
+    // Without an agent, ssh-keygen signs with the key file and asks for the PIN
+    // and the touch itself. An agent that holds the key would be asked
+    // instead, and one such as GNOME Keyring's cannot ask a security key for
+    // its PIN, so it refuses.
     let status = Command::new("git")
+        .env_remove("SSH_AUTH_SOCK")
         .args(["-c", "gpg.format=ssh"])
         .arg("-c")
         .arg(format!("user.signingkey={key}"))
