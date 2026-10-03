@@ -6,7 +6,7 @@ Releases a Cargo workspace from a hand-written `CHANGELOG.md`, and lets CI publi
 
 1. Run the `prepare-release` workflow with a version. It dates `## Unreleased`, sets the version and opens a pull request.
 2. Once its checks pass, check out the branch and run `touchgate approve`. It signs an empty `Approve release 0.4.0.` commit with the key, which asks for its PIN and a touch, and pushes it. Your git signing settings stay as they are.
-3. Within the hour, merge with a merge commit. The release publishes to crates.io, then tags and makes the GitHub release.
+3. Within the hour, merge with a merge commit. Once every check on the merge has passed, the release publishes to crates.io, then tags and makes the GitHub release.
 
 ## What it checks
 
@@ -72,6 +72,7 @@ jobs:
     permissions:
       contents: write
       id-token: write
+      checks: read
     with:
       commit: ${{ inputs.commit }}
       key: sk-ssh-ed25519@openssh.com AAAA...

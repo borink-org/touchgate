@@ -106,11 +106,37 @@ jobs:
       - run: '"$RUNNER_TEMP/touchgate/touchgate" check'
       - run: cargo publish --workspace --locked --dry-run
 
+  # Publishes only once every check on the merge commit has passed: the
+  # repository's own CI on the default branch, after the merge.
+  checks:
+    name: Wait for the merge's checks
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      checks: read # to read the merge commit's check runs
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: touchgate
+          path: ${{ runner.temp }}/touchgate
+      - name: Check the digest of touchgate
+        env:
+          SHA256: ${{ needs.verify.outputs.touchgate-sha256 }}
+        run: >-
+          echo "$SHA256  $RUNNER_TEMP/touchgate/touchgate" | sha256sum --check --strict
+          && chmod +x "$RUNNER_TEMP/touchgate/touchgate"
+      - name: Wait for every check on the merge to pass
+        env:
+          COMMIT: ${{ inputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: '"$RUNNER_TEMP/touchgate/touchgate" wait-for-checks --commit "$COMMIT"'
+
   # Compiles nothing: `--no-verify` packages and uploads what the build job
   # built, and `cargo metadata` runs no build script.
   publish:
     name: Publish to crates.io
-    needs: [verify, build]
+    needs: [verify, build, checks]
     runs-on: ubuntu-latest
     environment: release
     concurrency:

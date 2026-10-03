@@ -4,6 +4,7 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use crate::approval;
 use crate::version::Version;
@@ -199,6 +200,88 @@ pub fn release(commit: &str, version: &Version, changelog: &str) -> Result<(), S
             "{tag} names {} after the release, not {commit}",
             tagged.as_deref().unwrap_or("nothing")
         )),
+    }
+}
+
+/// How a finished check run may end and still let a release through.
+const PASSING: [&str; 3] = ["success", "neutral", "skipped"];
+
+/// Waits until every check run on `commit` has finished, and fails if one did
+/// not pass, or if some are still running after `timeout_seconds`. The jobs of
+/// this workflow run are left out, so a release run on the same commit does
+/// not wait for itself. GitHub's older commit statuses are not read.
+pub fn wait_for_checks(commit: &str, timeout_seconds: i64) -> Result<(), String> {
+    if !approval::is_hash(commit) {
+        return Err(format!("`{commit}` is not a full commit hash"));
+    }
+    let own_run = std::env::var("GITHUB_RUN_ID")
+        .ok()
+        .map(|id| format!("/actions/runs/{id}/"));
+    let started = Instant::now();
+    loop {
+        let pages = gh(&[
+            "api",
+            "--paginate",
+            "--slurp",
+            &format!("repos/{{owner}}/{{repo}}/commits/{commit}/check-runs?per_page=100"),
+        ])?;
+        let pages: serde_json::Value =
+            serde_json::from_str(&pages).map_err(|error| format!("gh api: {error}"))?;
+        let mut pending = Vec::new();
+        let mut failed = Vec::new();
+        let mut passed = 0;
+        for run in pages
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|page| page["check_runs"].as_array())
+            .flatten()
+        {
+            let url = run["details_url"].as_str().unwrap_or_default();
+            if own_run.as_deref().is_some_and(|own| url.contains(own)) {
+                continue;
+            }
+            let name = run["name"].as_str().unwrap_or("a check").to_owned();
+            match (run["status"].as_str(), run["conclusion"].as_str()) {
+                (Some("completed"), Some(conclusion)) if PASSING.contains(&conclusion) => {
+                    passed += 1
+                }
+                (Some("completed"), conclusion) => failed.push(format!(
+                    "{name} ({})",
+                    conclusion.unwrap_or("no conclusion")
+                )),
+                _ => pending.push(name),
+            }
+        }
+        if !failed.is_empty() {
+            return Err(format!(
+                "checks on {commit} did not pass: {}",
+                failed.join(", ")
+            ));
+        }
+        if pending.is_empty() && passed > 0 {
+            println!("all {passed} checks on {commit} passed");
+            return Ok(());
+        }
+        if started.elapsed() > Duration::from_secs(timeout_seconds as u64) {
+            return Err(format!(
+                "checks on {commit} are still not done: {}",
+                if pending.is_empty() {
+                    "none has started".to_owned()
+                } else {
+                    pending.join(", ")
+                }
+            ));
+        }
+        println!(
+            "waiting for {}",
+            if pending.is_empty() {
+                "the first check".to_owned()
+            } else {
+                pending.join(", ")
+            }
+        );
+        std::thread::sleep(Duration::from_secs(30));
     }
 }
 

@@ -34,7 +34,8 @@ usage:
   touchgate publish [<cargo publish arguments>...]
   touchgate approve [--key <private key>] [--no-push]
   touchgate start --commit <hash>
-  touchgate github-release --commit <hash>";
+  touchgate github-release --commit <hash>
+  touchgate wait-for-checks --commit <hash> [--timeout <30m | 2h>]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -50,6 +51,10 @@ fn main() -> ExitCode {
         ["approve", rest @ ..] => approve(rest),
         ["start", "--commit", commit] => github::start(commit).map_err(|error| vec![error]),
         ["github-release", "--commit", commit] => github_release(commit),
+        ["wait-for-checks", "--commit", commit] => wait_for_checks(commit, DEFAULT_CHECKS_TIMEOUT),
+        ["wait-for-checks", "--commit", commit, "--timeout", timeout] => {
+            wait_for_checks(commit, timeout)
+        }
         _ => Err(vec![USAGE.to_owned()]),
     };
     match result {
@@ -242,6 +247,16 @@ fn verify(args: &[&str]) -> Result<(), Vec<String>> {
     Ok(())
 }
 
+/// How long `wait-for-checks` waits unless `--timeout` says otherwise.
+const DEFAULT_CHECKS_TIMEOUT: &str = "2h";
+
+/// Waits for every check on `commit` to pass, as [`github::wait_for_checks`]
+/// describes.
+fn wait_for_checks(commit: &str, timeout: &str) -> Result<(), Vec<String>> {
+    let timeout = approval::parse_age(timeout).map_err(|error| vec![error])?;
+    github::wait_for_checks(commit, timeout).map_err(|error| vec![error])
+}
+
 /// The release key unless `--key` names another: the handle `ssh-keygen`
 /// writes for a key on a security key, beside its `.pub`.
 const DEFAULT_KEY: &str = "~/.ssh/id_ed25519_sk_signing";
@@ -321,7 +336,8 @@ fn approve(args: &[&str]) -> Result<(), Vec<String>> {
     let publish = publish.trim_end();
 
     println!(
-        "Approving release {version} at {}, to run from publish at {publish}. The key asks for its PIN and a touch.",
+        "Approving release {version} at {}, to run from publish at {publish}.\n\
+         Enter the key's PIN, then touch the key when it blinks.",
         head.trim_end()
     );
     // Without an agent, ssh-keygen signs with the key file and asks for the PIN
