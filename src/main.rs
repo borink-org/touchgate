@@ -6,6 +6,7 @@
 
 mod approval;
 mod changelog;
+mod github;
 mod version;
 mod workspace;
 
@@ -24,27 +25,30 @@ const DEFAULT_MAX_AGE: &str = "1h";
 const USAGE: &str = "\
 usage:
   touchgate check
-  touchgate prepare <version> [--date YYYY-MM-DD]
+  touchgate prepare <version> [--date YYYY-MM-DD] [--pull-request]
   touchgate check-entry <base revision>
   touchgate notes [<version>]
   touchgate verify --repo <dir> --commit <hash> --branch <ref> --key <public key>
                    [--max-age <30m | 1h | 7d>]
   touchgate publish [<cargo publish arguments>...]
-  touchgate approve [--key <private key>] [--no-push]";
+  touchgate approve [--key <private key>] [--no-push]
+  touchgate start --commit <hash>
+  touchgate github-release --commit <hash>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
         ["check"] => check().map(|version| println!("{version}")),
-        ["prepare", version] => prepare(version, None),
-        ["prepare", version, "--date", date] => prepare(version, Some(date)),
+        ["prepare", version, rest @ ..] => prepare(version, rest),
         ["check-entry", base] => check_entry(base),
         ["notes"] => notes(None),
         ["notes", version] => notes(Some(version)),
         ["verify", rest @ ..] => verify(rest),
         ["publish", rest @ ..] => publish(rest),
         ["approve", rest @ ..] => approve(rest),
+        ["start", "--commit", commit] => github::start(commit).map_err(|error| vec![error]),
+        ["github-release", "--commit", commit] => github_release(commit),
         _ => Err(vec![USAGE.to_owned()]),
     };
     match result {
@@ -75,14 +79,25 @@ fn check() -> Result<Version, Vec<String>> {
     }
 }
 
-/// Turns `## Unreleased` into the section of `version`, dated `date` or
-/// today, and sets `version` on every published package.
-fn prepare(version: &str, date: Option<&str>) -> Result<(), Vec<String>> {
+/// Turns `## Unreleased` into the section of `version`, dated `--date` or
+/// today, and sets `version` on every published package. With
+/// `--pull-request`, also commits that on `release/<version>`, pushes it and
+/// opens a pull request.
+fn prepare(version: &str, args: &[&str]) -> Result<(), Vec<String>> {
     let version = Version::parse(version).map_err(|error| vec![error])?;
-    let date = match date {
-        Some(date) => Date::parse(date).map_err(|error| vec![error])?,
-        None => Date::today(),
-    };
+    let (mut date, mut pull_request) = (None, false);
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        match *flag {
+            "--date" => {
+                let text = args.next().ok_or_else(|| vec![USAGE.to_owned()])?;
+                date = Some(Date::parse(text).map_err(|error| vec![error])?);
+            }
+            "--pull-request" => pull_request = true,
+            _ => return Err(vec![USAGE.to_owned()]),
+        }
+    }
+    let date = date.unwrap_or_else(Date::today);
     check()?;
     let workspace = Workspace::load()?;
     let path = changelog_path(&workspace);
@@ -96,7 +111,29 @@ fn prepare(version: &str, date: Option<&str>) -> Result<(), Vec<String>> {
     let checked = check()?;
     assert_eq!(checked, version);
     println!("{version}");
+    if pull_request {
+        github::pull_request(&version).map_err(|error| vec![error])?;
+    }
     Ok(())
+}
+
+/// Tags the release at `commit`, the checkout, and makes its GitHub release
+/// with its section of the changelog as the notes.
+fn github_release(commit: &str) -> Result<(), Vec<String>> {
+    let version = check()?;
+    let workspace = Workspace::load()?;
+    let text = read(&changelog_path(&workspace))?;
+    let notes = Changelog::parse(&text)?
+        .notes(&version)
+        .ok_or_else(|| vec![format!("CHANGELOG.md: no section for {version}")])?;
+    let head = run(Command::new("git").args(["rev-parse", "--verify", "HEAD^{commit}"]))?;
+    if head.trim_end() != commit {
+        return Err(vec![format!(
+            "the checkout is {}, not the release {commit}",
+            head.trim_end()
+        )]);
+    }
+    github::release(commit, &version, &notes).map_err(|error| vec![error])
 }
 
 /// Fails if the changes since `base` touch a published package but add

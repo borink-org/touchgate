@@ -5,6 +5,8 @@
 # `publish` branch, pinned to a touchgate commit; the README shows the file.
 # crates.io matches the caller's file, so that is the file its trusted
 # publisher names, with the `release` environment of the publish job here.
+# touchgate is built at the commit this workflow was called at,
+# `job.workflow_sha`.
 
 name: release
 
@@ -26,35 +28,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The touchgate commit this workflow was called at. GitHub's contexts all
-  # describe the caller, so the commit comes from the `job_workflow_sha` claim
-  # of an OIDC token. That token is for another audience and carries no
-  # environment, so crates.io would refuse it, and this job runs nothing but
-  # the request.
-  locate:
-    name: Find this touchgate commit
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write # to read job_workflow_sha from an OIDC token
-    outputs:
-      sha: ${{ steps.locate.outputs.sha }}
-    steps:
-      - id: locate
-        name: Read the commit from an OIDC token
-        run: |
-          set -euo pipefail
-          token=$(curl --silent --show-error --fail \
-            --header "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=touchgate" | jq -r .value)
-          payload=$(cut -d. -f2 <<< "$token" | tr '_-' '/+')
-          while (( ${#payload} % 4 )); do payload+="="; done
-          sha=$(base64 --decode <<< "$payload" | jq -r .job_workflow_sha)
-          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::job_workflow_sha is '$sha'"
-            exit 1
-          fi
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-
   # Checks the approval without running anything from the commit, because
   # until this passes the commit is untrusted: a `rust-toolchain.toml`, a
   # `.cargo/config.toml` or a build script in it could make the check pass.
@@ -62,30 +35,22 @@ jobs:
   # toolchain, and reads the commit with git alone.
   verify:
     name: Check the approval
-    needs: locate
     runs-on: ubuntu-latest
     permissions:
       contents: read # to fetch the default branch
     outputs:
       touchgate-sha256: ${{ steps.digest.outputs.sha256 }}
-    env:
-      TOUCHGATE_REV: ${{ needs.locate.outputs.sha }}
-      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
-      - name: Refuse to run from any branch but publish
-        run: |
-          if [ "$GITHUB_REF" != refs/heads/publish ]; then
-            echo "::error::Releases run from the publish branch, not $GITHUB_REF"
-            exit 1
-          fi
       - name: Build touchgate
         working-directory: ${{ runner.temp }}
-        run: |
-          cargo install --locked --root "$RUNNER_TEMP/touchgate" \
-            --git https://github.com/borink-org/touchgate --rev "$TOUCHGATE_REV" touchgate
+        env:
+          TOUCHGATE_REV: ${{ job.workflow_sha }}
+        run: >-
+          cargo install --locked --root "$RUNNER_TEMP/touchgate"
+          --git https://github.com/borink-org/touchgate --rev "$TOUCHGATE_REV" touchgate
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.DEFAULT_BRANCH }}
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
           persist-credentials: false
           path: repository
@@ -94,19 +59,17 @@ jobs:
         env:
           COMMIT: ${{ inputs.commit }}
           KEY: ${{ inputs.key }}
-        run: |
-          "$RUNNER_TEMP/touchgate/bin/touchgate" verify \
-            --repo "$GITHUB_WORKSPACE/repository" --commit "$COMMIT" \
-            --branch "origin/$DEFAULT_BRANCH" --key "$KEY"
+          BRANCH: origin/${{ github.event.repository.default_branch }}
+        run: >-
+          "$RUNNER_TEMP/touchgate/bin/touchgate" verify --repo "$GITHUB_WORKSPACE/repository"
+          --commit "$COMMIT" --branch "$BRANCH" --key "$KEY"
       # Later jobs run this binary only if it still has this digest. A job's
       # outputs cannot change once it ends, but a step in a later job can
       # replace the artifact, and the build job runs every dependency's build
-      # scripts.
+      # scripts. The binary cannot vouch for itself, so sha256sum does this.
       - name: Record the digest of touchgate
         id: digest
-        run: |
-          set -o pipefail
-          echo "sha256=$(sha256sum "$RUNNER_TEMP/touchgate/bin/touchgate" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        run: echo "sha256=$(sha256sum < "$RUNNER_TEMP/touchgate/bin/touchgate" | cut -c1-64)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: touchgate
@@ -123,8 +86,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read # to check out the release
-    outputs:
-      version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -134,21 +95,13 @@ jobs:
         with:
           name: touchgate
           path: ${{ runner.temp }}/touchgate
-      - name: Check touchgate and put it on PATH
+      - name: Check the digest of touchgate
         env:
           SHA256: ${{ needs.verify.outputs.touchgate-sha256 }}
-        run: |
+        run: >-
           echo "$SHA256  $RUNNER_TEMP/touchgate/touchgate" | sha256sum --check --strict
-          chmod +x "$RUNNER_TEMP/touchgate/touchgate"
-          echo "$RUNNER_TEMP/touchgate" >> "$GITHUB_PATH"
-      # Installs what `rust-toolchain.toml` pins, if the repository has one.
-      - name: Install the pinned Rust toolchain
-        run: if [ -e rust-toolchain.toml ] || [ -e rust-toolchain ]; then rustup toolchain install; fi
-      # touchgate prints only a version it parsed, so the output cannot carry
-      # anything else.
-      - name: Check the changelog and the versions
-        id: check
-        run: echo "version=$(touchgate check)" >> "$GITHUB_OUTPUT"
+          && chmod +x "$RUNNER_TEMP/touchgate/touchgate"
+      - run: '"$RUNNER_TEMP/touchgate/touchgate" check'
       - run: cargo publish --workspace --locked --dry-run
 
   # Compiles nothing: `--no-verify` packages and uploads what the build job
@@ -173,38 +126,28 @@ jobs:
         with:
           name: touchgate
           path: ${{ runner.temp }}/touchgate
-      - name: Check touchgate and put it on PATH
+      - name: Check the digest of touchgate
         env:
           SHA256: ${{ needs.verify.outputs.touchgate-sha256 }}
-        run: |
+        run: >-
           echo "$SHA256  $RUNNER_TEMP/touchgate/touchgate" | sha256sum --check --strict
-          chmod +x "$RUNNER_TEMP/touchgate/touchgate"
-          echo "$RUNNER_TEMP/touchgate" >> "$GITHUB_PATH"
-      - name: Install the pinned Rust toolchain
-        run: if [ -e rust-toolchain.toml ] || [ -e rust-toolchain ]; then rustup toolchain install; fi
+          && chmod +x "$RUNNER_TEMP/touchgate/touchgate"
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
       # Skips what is on crates.io already, so a release that failed halfway
       # can run again.
       - name: Publish
-        run: touchgate publish --locked --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: '"$RUNNER_TEMP/touchgate/touchgate" publish --locked --no-verify'
 
   # Only now does the tag exist, so a tag always names a published release.
-  # Anyone who can push can make tags and releases, so a tag or a release
-  # that exists already must point at this commit, or this fails rather than
-  # dress up someone else's.
   github-release:
     name: Tag and release on GitHub
-    needs: [verify, build, publish]
+    needs: [verify, publish]
     runs-on: ubuntu-latest
     permissions:
       contents: write # to create the tag and the release
-    env:
-      COMMIT: ${{ inputs.commit }}
-      VERSION: ${{ needs.build.outputs.version }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -214,61 +157,14 @@ jobs:
         with:
           name: touchgate
           path: ${{ runner.temp }}/touchgate
-      - name: Check touchgate and put it on PATH
+      - name: Check the digest of touchgate
         env:
           SHA256: ${{ needs.verify.outputs.touchgate-sha256 }}
-        run: |
+        run: >-
           echo "$SHA256  $RUNNER_TEMP/touchgate/touchgate" | sha256sum --check --strict
-          chmod +x "$RUNNER_TEMP/touchgate/touchgate"
-          echo "$RUNNER_TEMP/touchgate" >> "$GITHUB_PATH"
-      - name: Install the pinned Rust toolchain
-        run: if [ -e rust-toolchain.toml ] || [ -e rust-toolchain ]; then rustup toolchain install; fi
+          && chmod +x "$RUNNER_TEMP/touchgate/touchgate"
       - name: Tag the release and make a GitHub release
-        run: |
-          set -euo pipefail
-          tag="v$VERSION"
-
-          # The commit a tag names, or nothing if there is no such tag. An
-          # annotated tag is followed to its commit. Any answer but the tag or
-          # a 404 stops the release.
-          tagged_commit() {
-            local ref
-            if ! ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" 2> "$RUNNER_TEMP/error"); then
-              if grep -q 'HTTP 404' "$RUNNER_TEMP/error"; then return 0; fi
-              cat "$RUNNER_TEMP/error" >&2
-              exit 1
-            fi
-            if [ "$(jq -r .object.type <<< "$ref")" = tag ]; then
-              gh api "repos/$GITHUB_REPOSITORY/git/tags/$(jq -r .object.sha <<< "$ref")" \
-                --jq .object.sha
-            else
-              jq -r .object.sha <<< "$ref"
-            fi
-          }
-
-          existing=$(tagged_commit)
-          if [ -n "$existing" ] && [ "$existing" != "$COMMIT" ]; then
-            echo "::error::$tag names $existing, not the release $COMMIT. Delete it and run again."
-            exit 1
-          fi
-
-          if release=$(gh release view "$tag" --json isDraft 2> /dev/null); then
-            if [ "$(jq -r .isDraft <<< "$release")" = true ] || [ -z "$existing" ]; then
-              echo "::error::A release for $tag exists that this workflow did not make. Delete it and run again."
-              exit 1
-            fi
-            echo "$tag is released already"
-            exit 0
-          fi
-
-          touchgate notes "$VERSION" > "$RUNNER_TEMP/notes.md"
-          prerelease=()
-          if [[ "$VERSION" == *-* ]]; then prerelease=(--prerelease); fi
-          gh release create "$tag" --target "$COMMIT" --title "$VERSION" \
-            --notes-file "$RUNNER_TEMP/notes.md" "${prerelease[@]}"
-
-          created=$(tagged_commit)
-          if [ "$created" != "$COMMIT" ]; then
-            echo "::error::$tag names $created after the release, not $COMMIT"
-            exit 1
-          fi
+        env:
+          COMMIT: ${{ inputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+        run: '"$RUNNER_TEMP/touchgate/touchgate" github-release --commit "$COMMIT"'

@@ -39,6 +39,9 @@ const USER_VERIFIED: u8 = 0x04;
 /// The namespace git signs commits in.
 const NAMESPACE: &str = "git";
 
+/// How the subject of an approval starts.
+pub const APPROVAL: &str = "Approve release";
+
 /// The principal the one allowed key is listed under. Only this module reads
 /// the allowed-signers file, so the name is arbitrary.
 const PRINCIPAL: &str = "touchgate";
@@ -87,7 +90,7 @@ pub fn verify(
              changes that were not approved. Bring the release branch up to date and approve again"
         ));
     }
-    if !approved.subject.starts_with("Approve release") {
+    if !approved.subject.starts_with(APPROVAL) {
         return Err(format!(
             "the second parent {approval} is `{}`, not an approval starting with `Approve release`",
             approved.subject
@@ -190,8 +193,26 @@ fn describe(seconds: i64) -> String {
     }
 }
 
+/// The approval that the merge `commit` brings in, if its second parent's
+/// subject names one. Checks nothing else: this only decides whether a
+/// release is worth starting, and [`verify`] decides whether it publishes.
+pub fn merged_approval(repo: &Path, commit: &str) -> Result<Option<String>, String> {
+    if !is_hash(commit) {
+        return Err(format!("`{commit}` is not a full commit hash"));
+    }
+    let merge = RawCommit::read(repo, commit)?;
+    let [_, approval] = &merge.parents[..] else {
+        return Ok(None);
+    };
+    let approved = RawCommit::read(repo, approval)?;
+    Ok(approved
+        .subject
+        .starts_with(APPROVAL)
+        .then(|| approval.clone()))
+}
+
 /// Whether `text` is a full SHA-1 or SHA-256 commit hash.
-fn is_hash(text: &str) -> bool {
+pub fn is_hash(text: &str) -> bool {
     (text.len() == 40 || text.len() == 64)
         && text
             .bytes()

@@ -63,6 +63,13 @@ impl Version {
     }
 }
 
+impl Version {
+    /// Whether this is a pre-release, such as `1.0.0-rc.1`.
+    pub fn is_pre_release(&self) -> bool {
+        !self.pre.is_empty()
+    }
+}
+
 /// A decimal number without leading zeros.
 fn number(text: &str) -> Option<u64> {
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {

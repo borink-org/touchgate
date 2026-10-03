@@ -51,7 +51,6 @@ jobs:
       contents: write
       pull-requests: write
       actions: write
-      id-token: write
     with:
       version: ${{ inputs.version }}
 ```
