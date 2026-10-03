@@ -1,0 +1,23 @@
+[package]
+name = "touchgate"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Prepares Cargo releases, and lets CI publish one only after a hardware key approved it with a touch and a PIN"
+repository = "https://github.com/borink-org/touchgate"
+rust-version = "1.90"
+keywords = ["release", "publish", "fido2", "signing", "changelog"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+# Reads `cargo metadata`, for the workspace's packages and their versions.
+serde_json = "1.0.151"
+# Edits manifests without losing their formatting or comments.
+toml_edit = "0.25.15"
+
+[lints.rust]
+missing_docs = "deny"
+
+[dev-dependencies]
+ed25519-dalek = "3.0.0"
+sha2 = "0.11.0"
