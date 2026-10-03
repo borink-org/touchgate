@@ -29,7 +29,8 @@ usage:
   touchgate notes [<version>]
   touchgate verify --repo <dir> --commit <hash> --branch <ref> --key <public key>
                    [--max-age <30m | 1h | 7d>]
-  touchgate publish [<cargo publish arguments>...]";
+  touchgate publish [<cargo publish arguments>...]
+  touchgate approve [--key <private key>] [--no-push]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -43,6 +44,7 @@ fn main() -> ExitCode {
         ["notes", version] => notes(Some(version)),
         ["verify", rest @ ..] => verify(rest),
         ["publish", rest @ ..] => publish(rest),
+        ["approve", rest @ ..] => approve(rest),
         _ => Err(vec![USAGE.to_owned()]),
     };
     match result {
@@ -195,6 +197,103 @@ fn verify(args: &[&str]) -> Result<(), Vec<String>> {
     let approval = approval::verify(Path::new(repo), commit, key, branch, max_age)
         .map_err(|error| vec![error])?;
     println!("{approval}");
+    Ok(())
+}
+
+/// The release key unless `--key` names another: the handle `ssh-keygen`
+/// writes for a key on a security key, beside its `.pub`.
+const DEFAULT_KEY: &str = "~/.ssh/id_ed25519_sk_signing";
+
+/// Signs the approval of the release branch checked out, and pushes it.
+///
+/// The key is given to this one `git commit`, so git's own signing settings
+/// stay as they are. Nothing from the branch runs: the version comes from the
+/// branch name, since running `cargo` would run code not yet approved.
+fn approve(args: &[&str]) -> Result<(), Vec<String>> {
+    let (mut key, mut push) = (DEFAULT_KEY.to_owned(), true);
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        match *flag {
+            "--key" => key = (*args.next().ok_or_else(|| vec![USAGE.to_owned()])?).to_owned(),
+            "--no-push" => push = false,
+            _ => return Err(vec![USAGE.to_owned()]),
+        }
+    }
+    if let Some(rest) = key.strip_prefix("~/") {
+        let home = std::env::var("HOME").map_err(|_| vec!["HOME is not set".to_owned()])?;
+        key = format!("{home}/{rest}");
+    }
+    if !Path::new(&key).is_file() {
+        return Err(vec![format!("{key}: no such key. Pass the key with --key")]);
+    }
+
+    let branch = run(Command::new("git").args(["symbolic-ref", "--short", "HEAD"]))?;
+    let branch = branch.trim_end();
+    let version = branch.strip_prefix("release/").ok_or_else(|| {
+        vec![format!(
+            "`{branch}` is not a release branch, release/<version>"
+        )]
+    })?;
+    let version = Version::parse(version).map_err(|error| vec![error])?;
+
+    if !run(Command::new("git").args(["status", "--porcelain"]))?.is_empty() {
+        return Err(vec![
+            "the working tree has changes. An approval covers the commit, so commit or drop them first"
+                .to_owned(),
+        ]);
+    }
+    // The branch name parsed as `release/<version>`, so it is a plain ref
+    // name and cannot read as an option.
+    let tracking = format!("refs/remotes/origin/{branch}");
+    run(Command::new("git").args([
+        "fetch",
+        "--quiet",
+        "origin",
+        &format!("+refs/heads/{branch}:{tracking}"),
+    ]))?;
+    let head = run(Command::new("git").args(["rev-parse", "--verify", "HEAD^{commit}"]))?;
+    let remote = run(Command::new("git").args([
+        "rev-parse",
+        "--verify",
+        &format!("{tracking}^{{commit}}"),
+    ]))?;
+    if head != remote {
+        return Err(vec![format!(
+            "HEAD is not origin/{branch}. Approve exactly what is pushed: pull or push first"
+        )]);
+    }
+
+    println!(
+        "Approving release {version} at {}. The key asks for its PIN and a touch.",
+        head.trim_end()
+    );
+    let status = Command::new("git")
+        .args(["-c", "gpg.format=ssh"])
+        .arg("-c")
+        .arg(format!("user.signingkey={key}"))
+        .args([
+            "commit",
+            "--allow-empty",
+            "--no-verify",
+            "--gpg-sign",
+            "--message",
+        ])
+        .arg(format!("Approve release {version}."))
+        .status()
+        .map_err(|error| vec![format!("git: {error}")])?;
+    if !status.success() {
+        return Err(vec!["git commit could not sign the approval".to_owned()]);
+    }
+    if push {
+        let status = Command::new("git")
+            .args(["push", "origin"])
+            .arg(format!("HEAD:refs/heads/{branch}"))
+            .status()
+            .map_err(|error| vec![format!("git: {error}")])?;
+        if !status.success() {
+            return Err(vec!["git push failed".to_owned()]);
+        }
+    }
     Ok(())
 }
 

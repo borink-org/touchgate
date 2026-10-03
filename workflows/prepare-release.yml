@@ -62,13 +62,12 @@ jobs:
           cat > "$RUNNER_TEMP/body.md" <<EOF
           This sets every published package to $VERSION and dates its section of the changelog.
 
-          To approve the release, check out this branch, look it over, and sign an empty commit with the release key. The key asks for its PIN and a touch.
+          To approve the release, check out this branch, look it over, and once the checks pass run \`touchgate approve\`. It signs an empty commit with the release key, which asks for its PIN and a touch, and pushes it.
 
           \`\`\`
           git fetch origin
           git switch $branch
-          git commit --allow-empty -S -m "Approve release $VERSION."
-          git push
+          touchgate approve
           \`\`\`
 
           Pushing the approval also starts this pull request's checks, which a pull request opened by a workflow does not start on its own. An approval lasts an hour, so merge once they pass; if the hour runs out, approve again.
