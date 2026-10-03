@@ -25,7 +25,7 @@ A release that fails halfway can run again: packages on crates.io already are sk
 - that commit has the same tree as the merge, so the signature covers exactly what is published,
 - that commit is signed in git's namespace by the one key `release.yml` names, and `ssh-keygen -Y verify` accepts the signature,
 - the signature's authenticator flags say the key was touched and its PIN entered,
-- and the approval is at most 7 days old by its committer time, which the signature covers, so an approval you abandoned cannot be merged and released later.
+- and the approval is at most an hour old by its committer time, which the signature covers, so an approval you abandoned cannot be merged and released later. Approve once the pull request's checks pass, and merge within the hour. `--max-age` gives another limit.
 
 The last check is why touchgate exists. `git verify-commit` and `ssh-keygen -Y verify` accept a FIDO2 signature made without a touch or a PIN: the allowed-signers format has no option that demands either, and a FIDO2 key asked for a silent assertion signs without one. The authenticator signs its flags byte along with the message, so touchgate can read it and cannot be fooled by a changed one.
 
@@ -98,7 +98,7 @@ touchgate releases every published package of a workspace together, at one versi
 | `touchgate prepare <version> [--date YYYY-MM-DD]` | Releases `## Unreleased` as `<version>`, dated today in UTC unless given, and sets the version. |
 | `touchgate check-entry <base>` | Fails if the changes since `<base>` touch a published package but add nothing under `## Unreleased`. |
 | `touchgate notes [<version>]` | Prints the section of a version, for the notes of a GitHub release. |
-| `touchgate verify --repo <dir> --commit <hash> --branch <ref> --key <public key> [--max-age-days <days>]` | Checks a release's approval, at most 7 days old unless given, and prints the approval commit. |
+| `touchgate verify --repo <dir> --commit <hash> --branch <ref> --key <public key> [--max-age <30m \| 1h \| 7d>]` | Checks a release's approval, at most an hour old unless given, and prints the approval commit. |
 | `touchgate publish [<cargo publish arguments>]` | Publishes the packages whose version is not on crates.io yet. |
 
 ## License

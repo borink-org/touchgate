@@ -44,8 +44,8 @@ const NAMESPACE: &str = "git";
 const PRINCIPAL: &str = "touchgate";
 
 /// How far an approval's committer time may lie ahead of the clock, for a
-/// signing machine whose clock runs fast.
-const CLOCK_SKEW_SECONDS: i64 = 3_600;
+/// signing machine whose clock runs a little fast.
+const CLOCK_SKEW_SECONDS: i64 = 300;
 
 /// Checks that `commit` in the repository at `repo` is a release that `key`
 /// approved at most `max_age_seconds` ago, and returns the approval commit.
@@ -140,9 +140,9 @@ pub fn verify(
     let age = now - approved.committer_time;
     if age > max_age_seconds {
         return Err(format!(
-            "the approval {approval} is {} days old, older than the {} days an approval lasts. Approve again",
-            age / 86_400,
-            max_age_seconds / 86_400
+            "the approval {approval} is {} old, older than the {} an approval lasts. Approve again",
+            describe(age),
+            describe(max_age_seconds)
         ));
     }
     if age < -CLOCK_SKEW_SECONDS {
@@ -152,6 +152,42 @@ pub fn verify(
         ));
     }
     Ok(approval)
+}
+
+/// Reads how long an approval lasts, such as `30m`, `1h` or `7d`, in seconds.
+/// From a minute to 30 days.
+pub fn parse_age(text: &str) -> Result<i64, String> {
+    let invalid = || format!("`{text}` is not a duration from 1m to 30d, such as 30m, 1h or 7d");
+    let (number, unit) = text.split_at(text.len().saturating_sub(1));
+    let unit = match unit {
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        _ => return Err(invalid()),
+    };
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let seconds = number
+        .parse::<i64>()
+        .ok()
+        .and_then(|number| number.checked_mul(unit))
+        .ok_or_else(invalid)?;
+    if (60..=30 * 86_400).contains(&seconds) {
+        Ok(seconds)
+    } else {
+        Err(invalid())
+    }
+}
+
+/// A number of seconds in the unit that reads best: minutes under two hours,
+/// hours under two days, days beyond.
+fn describe(seconds: i64) -> String {
+    match seconds {
+        ..7_200 => format!("{} minutes", seconds / 60),
+        7_200..172_800 => format!("{} hours", seconds / 3_600),
+        _ => format!("{} days", seconds / 86_400),
+    }
 }
 
 /// Whether `text` is a full SHA-1 or SHA-256 commit hash.
@@ -517,6 +553,26 @@ mod tests {
 
         fido.push(0);
         assert!(Signature::parse(&sshsig(&fido)).is_err());
+    }
+
+    #[test]
+    fn ages() {
+        assert_eq!(parse_age("1h"), Ok(3_600));
+        assert_eq!(parse_age("30m"), Ok(1_800));
+        assert_eq!(parse_age("7d"), Ok(604_800));
+        for invalid in [
+            "",
+            "h",
+            "0m",
+            "31d",
+            "1",
+            "1w",
+            "-1h",
+            "+1h",
+            "99999999999999999d",
+        ] {
+            assert!(parse_age(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

@@ -95,15 +95,27 @@ fn refuses_another_key() {
 
 #[test]
 fn refuses_a_stale_approval() {
-    let eight_days = 8 * 86_400;
-    let output = Release::build(
-        PRESENT_AND_VERIFIED,
-        PRESENT_AND_VERIFIED,
-        false,
-        eight_days,
-    )
-    .verify();
-    assert!(stderr(&output).contains("days old"), "{}", stderr(&output));
+    let two_hours = 2 * 3_600;
+    let release = Release::build(PRESENT_AND_VERIFIED, PRESENT_AND_VERIFIED, false, two_hours);
+    let output = release.verify();
+    let expected = "2 hours old, older than the 60 minutes an approval lasts";
+    assert!(stderr(&output).contains(expected), "{}", stderr(&output));
+    // A longer limit admits it.
+    let longer = Command::new(env!("CARGO_BIN_EXE_touchgate"))
+        .args(["verify", "--repo"])
+        .arg(&release.dir)
+        .args([
+            "--commit",
+            &release.merge,
+            "--branch",
+            "main",
+            "--key",
+            &release.key,
+        ])
+        .args(["--max-age", "3h"])
+        .output()
+        .unwrap();
+    assert!(longer.status.success(), "{}", stderr(&longer));
 }
 
 #[test]

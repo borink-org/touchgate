@@ -16,8 +16,10 @@ use changelog::Changelog;
 use version::{Date, Version};
 use workspace::Workspace;
 
-/// How long an approval lasts unless `--max-age-days` says otherwise.
-const DEFAULT_MAX_AGE_DAYS: i64 = 7;
+/// How long an approval lasts unless `--max-age` says otherwise: long enough
+/// to merge once the pull request's checks pass, and short enough that an
+/// approval left unmerged is soon worthless.
+const DEFAULT_MAX_AGE: &str = "1h";
 
 const USAGE: &str = "\
 usage:
@@ -26,7 +28,7 @@ usage:
   touchgate check-entry <base revision>
   touchgate notes [<version>]
   touchgate verify --repo <dir> --commit <hash> --branch <ref> --key <public key>
-                   [--max-age-days <days>]
+                   [--max-age <30m | 1h | 7d>]
   touchgate publish [<cargo publish arguments>...]";
 
 fn main() -> ExitCode {
@@ -172,7 +174,7 @@ fn notes(version: Option<&str>) -> Result<(), Vec<String>> {
 /// Checks a release's approval with [`approval::verify`], and prints the
 /// approval commit. Reads no workspace, since the tree is not trusted yet.
 fn verify(args: &[&str]) -> Result<(), Vec<String>> {
-    let (mut repo, mut commit, mut branch, mut key, mut days) = (None, None, None, None, None);
+    let (mut repo, mut commit, mut branch, mut key, mut max_age) = (None, None, None, None, None);
     let mut args = args.iter();
     while let Some(flag) = args.next() {
         let slot = match *flag {
@@ -180,7 +182,7 @@ fn verify(args: &[&str]) -> Result<(), Vec<String>> {
             "--commit" => &mut commit,
             "--branch" => &mut branch,
             "--key" => &mut key,
-            "--max-age-days" => &mut days,
+            "--max-age" => &mut max_age,
             _ => return Err(vec![USAGE.to_owned()]),
         };
         *slot = Some(*args.next().ok_or_else(|| vec![USAGE.to_owned()])?);
@@ -188,15 +190,9 @@ fn verify(args: &[&str]) -> Result<(), Vec<String>> {
     let (Some(repo), Some(commit), Some(branch), Some(key)) = (repo, commit, branch, key) else {
         return Err(vec![USAGE.to_owned()]);
     };
-    let days: i64 = match days {
-        Some(days) => days
-            .parse()
-            .ok()
-            .filter(|days| (1..=365).contains(days))
-            .ok_or_else(|| vec![format!("`{days}` is not a number of days from 1 to 365")])?,
-        None => DEFAULT_MAX_AGE_DAYS,
-    };
-    let approval = approval::verify(Path::new(repo), commit, key, branch, days * 86_400)
+    let max_age =
+        approval::parse_age(max_age.unwrap_or(DEFAULT_MAX_AGE)).map_err(|error| vec![error])?;
+    let approval = approval::verify(Path::new(repo), commit, key, branch, max_age)
         .map_err(|error| vec![error])?;
     println!("{approval}");
     Ok(())
