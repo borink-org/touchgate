@@ -112,7 +112,8 @@ fn prepare(version: &str, args: &[&str]) -> Result<(), Vec<String>> {
     assert_eq!(checked, version);
     println!("{version}");
     if pull_request {
-        github::pull_request(&version).map_err(|error| vec![error])?;
+        github::pull_request(&version, &changelog_in_repository(&workspace)?)
+            .map_err(|error| vec![error])?;
     }
     Ok(())
 }
@@ -128,15 +129,8 @@ fn github_release(commit: &str) -> Result<(), Vec<String>> {
             head.trim_end()
         )]);
     }
-    let workspace = Workspace::load()?;
-    let top =
-        PathBuf::from(run(Command::new("git").args(["rev-parse", "--show-toplevel"]))?.trim_end());
-    let path = changelog_path(&workspace);
-    let relative = path.strip_prefix(&top).unwrap_or(&path);
-    let relative = relative
-        .to_str()
-        .ok_or_else(|| vec![format!("{} is not a UTF-8 path", relative.display())])?;
-    github::release(commit, &version, relative).map_err(|error| vec![error])
+    let changelog = changelog_in_repository(&Workspace::load()?)?;
+    github::release(commit, &version, &changelog).map_err(|error| vec![error])
 }
 
 /// Fails if the changes since `base` touch a published package but add
@@ -391,6 +385,18 @@ fn publish(cargo_args: &[&str]) -> Result<(), Vec<String>> {
     } else {
         Err(vec![format!("cargo publish failed: {status}")])
     }
+}
+
+/// The changelog's path in the git repository, which a link on GitHub names.
+fn changelog_in_repository(workspace: &Workspace) -> Result<String, Vec<String>> {
+    let top =
+        PathBuf::from(run(Command::new("git").args(["rev-parse", "--show-toplevel"]))?.trim_end());
+    let path = changelog_path(workspace);
+    let relative = path.strip_prefix(&top).unwrap_or(&path);
+    relative
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| vec![format!("{} is not a UTF-8 path", relative.display())])
 }
 
 /// The changelog, at the root of the workspace.

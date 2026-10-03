@@ -37,9 +37,56 @@ pub fn start(commit: &str) -> Result<(), String> {
     }
 }
 
+/// The GitHub release a version gets: what [`release`] makes, and what the
+/// pull request of [`pull_request`] shows ahead of it.
+struct GitHubRelease {
+    /// The tag, which is also the title.
+    tag: String,
+    notes: String,
+    pre_release: bool,
+}
+
+impl GitHubRelease {
+    /// The release of `version`, whose notes point at `changelog`, the
+    /// changelog's path in the repository, as it reads at the tag.
+    fn of(version: &Version, changelog: &str) -> Result<Self, String> {
+        let tag = format!("v{version}");
+        let url = gh(&["repo", "view", "--json", "url", "--jq", ".url"])?;
+        let name = changelog.rsplit('/').next().unwrap_or(changelog);
+        let notes = format!("See [{name}]({}/blob/{tag}/{changelog}).", url.trim_end());
+        Ok(Self {
+            tag,
+            notes,
+            pre_release: version.is_pre_release(),
+        })
+    }
+
+    /// The release as the pull request describes it.
+    fn preview(&self) -> String {
+        let kind = if self.pre_release {
+            "a pre-release"
+        } else {
+            "the latest release"
+        };
+        let quoted: String = self
+            .notes
+            .lines()
+            .map(|line| format!("> {line}\n"))
+            .collect();
+        format!(
+            "Once published, the merge commit is tagged `{tag}` and gets this GitHub release, as {kind}:\n\n\
+             - Title: `{tag}`\n\
+             - Notes:\n\n{quoted}",
+            tag = self.tag
+        )
+    }
+}
+
 /// Commits the prepared release on its branch, pushes it, and opens a pull
-/// request for it, or updates the one that is open.
-pub fn pull_request(version: &Version) -> Result<(), String> {
+/// request for it, or updates the one that is open. `changelog` is the
+/// changelog's path in the repository.
+pub fn pull_request(version: &Version, changelog: &str) -> Result<(), String> {
+    let release = GitHubRelease::of(version, changelog)?;
     let branch = release_branch(version);
     git(&["switch", "--create", &branch])?;
     git(&[
@@ -74,7 +121,11 @@ touchgate approve
 Pushing the approval also starts this pull request's checks, which a pull request opened by a workflow does not start on its own. An approval lasts an hour, so merge once they pass; if the hour runs out, approve again.
 
 Merge with a merge commit, never by squashing or rebasing, which would drop the signature. The release then publishes to crates.io, and tags and releases {version} on GitHub once that succeeds. If the default branch moves before the merge, merge it into this branch and approve again, since a release publishes only the exact tree that was approved.
-"
+
+## The GitHub release
+
+{preview}",
+        preview = release.preview()
     );
     let title = format!("Release {version}.");
     match gh(&[
@@ -88,9 +139,8 @@ Merge with a merge commit, never by squashing or rebasing, which would drop the 
     Ok(())
 }
 
-/// Tags `commit` as `v<version>` and makes its GitHub release, titled with
-/// the tag and pointing at `changelog`, the changelog's path in the
-/// repository, as it reads at the tag.
+/// Tags `commit` and makes its GitHub release, as [`GitHubRelease::of`]
+/// describes it.
 ///
 /// Anyone who can push can make tags and releases, so a tag or a release that
 /// exists already must point at `commit`, or this fails rather than dress up
@@ -100,8 +150,9 @@ pub fn release(commit: &str, version: &Version, changelog: &str) -> Result<(), S
     if !approval::is_hash(commit) {
         return Err(format!("`{commit}` is not a full commit hash"));
     }
-    let tag = format!("v{version}");
-    let existing = tagged_commit(&tag)?;
+    let release = GitHubRelease::of(version, changelog)?;
+    let tag = &release.tag;
+    let existing = tagged_commit(tag)?;
     if let Some(existing) = &existing
         && existing != commit
     {
@@ -111,7 +162,7 @@ pub fn release(commit: &str, version: &Version, changelog: &str) -> Result<(), S
     }
 
     match gh(&[
-        "release", "view", &tag, "--json", "isDraft", "--jq", ".isDraft",
+        "release", "view", tag, "--json", "isDraft", "--jq", ".isDraft",
     ]) {
         Ok(draft) => {
             if draft.trim() == "true" || existing.is_none() {
@@ -126,18 +177,23 @@ pub fn release(commit: &str, version: &Version, changelog: &str) -> Result<(), S
         Err(error) => return Err(error),
     }
 
-    let url = gh(&["repo", "view", "--json", "url", "--jq", ".url"])?;
-    let name = changelog.rsplit('/').next().unwrap_or(changelog);
-    let notes = format!("See [{name}]({}/blob/{tag}/{changelog}).", url.trim_end());
     let mut args = vec![
-        "release", "create", &tag, "--target", commit, "--title", &tag, "--notes", &notes,
+        "release",
+        "create",
+        tag,
+        "--target",
+        commit,
+        "--title",
+        tag,
+        "--notes",
+        &release.notes,
     ];
-    if version.is_pre_release() {
+    if release.pre_release {
         args.push("--prerelease");
     }
     gh(&args)?;
 
-    match tagged_commit(&tag)? {
+    match tagged_commit(tag)? {
         Some(tagged) if tagged == commit => Ok(()),
         tagged => Err(format!(
             "{tag} names {} after the release, not {commit}",
