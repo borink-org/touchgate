@@ -336,34 +336,16 @@ fn approve(args: &[&str]) -> Result<(), Vec<String>> {
     let publish = publish.trim_end();
 
     println!(
-        "Approving release {version} at {}, to run from publish at {publish}.\n\
-         Enter the key's PIN, then touch the key when it blinks.",
+        "Approving release {version} at {}, to run from publish at {publish}.",
         head.trim_end()
     );
-    // Without an agent, ssh-keygen signs with the key file and asks for the PIN
-    // and the touch itself. An agent that holds the key would be asked
-    // instead, and one such as GNOME Keyring's cannot ask a security key for
-    // its PIN, so it refuses.
-    let status = Command::new("git")
-        .env_remove("SSH_AUTH_SOCK")
-        .args(["-c", "gpg.format=ssh"])
-        .arg("-c")
-        .arg(format!("user.signingkey={key}"))
-        .args([
-            "commit",
-            "--allow-empty",
-            "--no-verify",
-            "--gpg-sign",
-            "--message",
-        ])
-        .arg(format!("{} {version}.", approval::APPROVAL))
-        .arg("--message")
-        .arg(format!("{}: {publish}", approval::WORKFLOW_TRAILER))
-        .status()
-        .map_err(|error| vec![format!("git: {error}")])?;
-    if !status.success() {
-        return Err(vec!["git commit could not sign the approval".to_owned()]);
-    }
+    let message = format!(
+        "{} {version}.\n\n{}: {publish}\n",
+        approval::APPROVAL,
+        approval::WORKFLOW_TRAILER
+    );
+    approval::sign_approval(Path::new(&key), branch, head.trim_end(), &message)
+        .map_err(|error| vec![error])?;
     if push {
         let status = Command::new("git")
             .args(["push", "origin"])

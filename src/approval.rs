@@ -393,6 +393,114 @@ fn ssh_keygen_verify(
     result
 }
 
+/// Commits an empty, signed approval with `message` on top of `head`, the tip
+/// of `branch`, and moves the branch to it.
+///
+/// This signs with `ssh-keygen -Y sign` itself rather than through
+/// `git commit -S`, because git keeps ssh-keygen's error output to itself, and
+/// that is where ssh-keygen asks to confirm user presence after the PIN. It
+/// signs without an SSH agent: an agent that holds the key would be asked
+/// instead, and one such as GNOME Keyring's cannot ask a security key for its
+/// PIN, so it refuses.
+pub fn sign_approval(
+    key: &Path,
+    branch: &str,
+    head: &str,
+    message: &str,
+) -> Result<String, String> {
+    if !is_hash(head) {
+        return Err(format!("`{head}` is not a full commit hash"));
+    }
+    let local = |args: &[&str]| -> Result<String, String> {
+        let output = Command::new("git")
+            .args(args)
+            .output()
+            .map_err(|error| format!("git: {error}"))?;
+        if output.status.success() {
+            Ok(crate::utf8(output.stdout, "git")?.trim_end().to_owned())
+        } else {
+            Err(format!(
+                "git {}: {}",
+                args.join(" "),
+                crate::utf8(output.stderr, "git")?.trim()
+            ))
+        }
+    };
+    let tree = local(&["rev-parse", "--verify", &format!("{head}^{{tree}}")])?;
+    let author = local(&["var", "GIT_AUTHOR_IDENT"])?;
+    let committer = local(&["var", "GIT_COMMITTER_IDENT"])?;
+    let unsigned =
+        format!("tree {tree}\nparent {head}\nauthor {author}\ncommitter {committer}\n\n{message}");
+
+    let dir = fresh_dir()?;
+    let payload = dir.join("commit");
+    let signed = std::fs::write(&payload, &unsigned)
+        .map_err(|error| error.to_string())
+        .and_then(|()| {
+            let status = Command::new("ssh-keygen")
+                .env_remove("SSH_AUTH_SOCK")
+                .args(["-Y", "sign", "-n", NAMESPACE, "-f"])
+                .arg(key)
+                .arg(&payload)
+                .status()
+                .map_err(|error| format!("ssh-keygen: {error}"))?;
+            if !status.success() {
+                return Err("ssh-keygen could not sign the approval".to_owned());
+            }
+            std::fs::read_to_string(dir.join("commit.sig")).map_err(|error| error.to_string())
+        });
+    let _ = std::fs::remove_dir_all(&dir);
+    let signature = signed?;
+
+    let header = if head.len() == 64 {
+        "gpgsig-sha256"
+    } else {
+        "gpgsig"
+    };
+    let signature = signature.trim_end().replace('\n', "\n ");
+    let (headers, body) = unsigned.split_once("\n\n").expect("written above");
+    let commit = format!("{headers}\n{header} {signature}\n\n{body}");
+
+    let mut child = Command::new("git")
+        .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("git: {error}"))?;
+    child
+        .stdin
+        .take()
+        .expect("piped")
+        .write_all(commit.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "git hash-object: {}",
+            crate::utf8(output.stderr, "git")?.trim()
+        ));
+    }
+    let approval = crate::utf8(output.stdout, "git")?.trim_end().to_owned();
+    // Moves the branch only if it is still at `head`.
+    local(&[
+        "update-ref",
+        "-m",
+        "touchgate approve",
+        &format!("refs/heads/{branch}"),
+        &approval,
+        head,
+    ])?;
+    println!(
+        "[{branch} {}] {}",
+        &approval[..7],
+        message.lines().next().unwrap_or_default()
+    );
+    Ok(approval)
+}
+
 /// A directory no one else made: creating it fails if the name is taken, so
 /// nothing placed there beforehand is read as the allowed signers.
 fn fresh_dir() -> Result<PathBuf, String> {
