@@ -439,7 +439,9 @@ pub fn sign_approval(
         .and_then(|()| {
             let status = Command::new("ssh-keygen")
                 .env_remove("SSH_AUTH_SOCK")
-                .args(["-Y", "sign", "-n", NAMESPACE, "-f"])
+                // -q drops "Signing file" and "Write signature to", and keeps
+                // the PIN prompt and "Confirm user presence".
+                .args(["-q", "-Y", "sign", "-n", NAMESPACE, "-f"])
                 .arg(key)
                 .arg(&payload)
                 .status()
