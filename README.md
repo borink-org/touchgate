@@ -1,5 +1,7 @@
 # touchgate
 
+**EXPERIMENTAL: Still playing around, do not depend on its security!**
+
 Releases a Cargo workspace from a hand-written `CHANGELOG.md`, and lets CI publish to crates.io only after you approve with a FIDO2 security key, by touch and PIN. Nothing holding your GitHub token, such as a coding agent, can publish on its own.
 
 ## Release
