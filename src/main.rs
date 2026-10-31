@@ -13,7 +13,7 @@ mod version;
 mod workspace;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 use changelog::Changelog;
 use project::Project;
@@ -178,6 +178,8 @@ fn check_entry(base: &str) -> Result<(), Vec<String>> {
     // A base from before the changelog existed has no entries.
     let exists = Command::new("git")
         .args(["cat-file", "-e", &at_base])
+        // A missing file is an answer here, not an error to show.
+        .stderr(Stdio::null())
         .status()
         .map_err(|error| vec![format!("git: {error}")])?
         .success();
