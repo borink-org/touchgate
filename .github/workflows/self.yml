@@ -1,0 +1,31 @@
+# touchgate's release process for touchgate itself: the reusable workflow at
+# this commit, with touchgate built from source, since the commit is not a
+# release yet.
+name: touchgate (self)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The version to release, such as 0.1.0
+        required: true
+        type: string
+  push:
+    branches: [main]
+  pull_request:
+    # The three default types, and a label change, so that adding no-changelog
+    # runs the changelog check again.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions: {}
+
+jobs:
+  touchgate:
+    uses: $/.github/workflows/touchgate.yml
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    with:
+      version: ${{ inputs.version }}
+      from-source: true

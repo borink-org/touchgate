@@ -30,7 +30,7 @@ ssh-keygen -t ed25519-sk -O resident -O verify-required -O application=ssh:signi
 cargo install --locked --git https://github.com/borink-org/touchgate
 ```
 
-Add two workflows that call touchgate's, pinned to a touchgate commit. `.github/workflows/touchgate.yml`, with your default branch:
+Add two workflows that call touchgate's, pinned to the commit of a touchgate release, which its tag on GitHub names. `.github/workflows/touchgate.yml`, with your default branch:
 
 ```yaml
 name: touchgate
@@ -72,7 +72,7 @@ on:
 permissions: {}
 jobs:
   release:
-    uses: borink-org/touchgate/.github/workflows/release.yml@<commit>
+    uses: borink-org/touchgate/.github/workflows/crates-release.yml@<commit>
     permissions:
       contents: write
       id-token: write
@@ -98,4 +98,8 @@ Use [`examples/pypi-release.yml`](examples/pypi-release.yml) as `.github/workflo
 
 The example builds with `uv build`. For maturin, build the wheels in the `build` job with [PyO3/maturin-action](https://github.com/PyO3/maturin-action) instead, in a matrix, and download them all into `dist`.
 
-Each job installs touchgate with `cargo install --locked`, including the job that publishes, so touchgate's own locked dependencies build there. Their versions are fixed by touchgate's `Cargo.lock`.
+Each job installs touchgate with `borink-org/touchgate/install`, pinned to the commit of a touchgate release. The action downloads that release's static Linux binary and runs `gh attestation verify` on it first, which shows that touchgate's own `release.yml` built it on touchgate's protected `publish` branch. A commit that is not a release fails, unless `from-source: true` builds it with cargo instead. The jobs of the reusable `touchgate.yml` install touchgate the same way.
+
+## touchgate's own releases
+
+touchgate is released with itself: `self.yml` runs `touchgate.yml` at the same commit, building touchgate from source, and `release.yml` builds the binaries for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` with a pinned Rust, attests them in a job that builds nothing, and attaches them to the GitHub release. It publishes nothing to crates.io.

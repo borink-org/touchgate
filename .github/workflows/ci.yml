@@ -27,3 +27,33 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       # The tests in `tests/verify.rs` run the real git and ssh-keygen.
       - run: cargo test --locked
+
+  # What release.yml builds, so that a release finds no surprise.
+  binaries:
+    name: Build for ${{ matrix.target }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup toolchain install 1.99.1 --profile minimal --target "$TARGET"
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo +1.99.1 build --release --locked --target "$TARGET"
+      - name: Run the static binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: >-
+          file "target/$TARGET/release/touchgate"
+          && "target/$TARGET/release/touchgate" check
