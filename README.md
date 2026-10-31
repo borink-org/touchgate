@@ -86,13 +86,7 @@ Allow GitHub Actions to create pull requests, and add a `no-changelog` label for
 
 ## A Python package on PyPI
 
-Add a `touchgate.json` at the root of the repository:
-
-```json
-{ "registry": "pypi" }
-```
-
-touchgate then releases the package of `pyproject.toml`, whose `project.version` it reads and sets, and moves `uv.lock` along if there is one. For a Rust extension built with maturin, add `"extension": "maturin"`: the packages of the Cargo workspace then move with the Python package's version, whether they are published or not, and `check` fails if they disagree. touchgate does not release pre-releases to PyPI yet, since PyPI writes them another way than Cargo. Without a `touchgate.json`, touchgate releases the Cargo workspace to crates.io.
+touchgate releases to PyPI when the repository has a `pyproject.toml` at its root with a `[project]` table, and to crates.io otherwise. A `pyproject.toml` that only configures tools changes nothing. touchgate releases the package of `pyproject.toml`, whose `project.version` it reads and sets, and moves `uv.lock` along if there is one. If its `build-backend` is `maturin`, the packages of the Cargo workspace move with the Python package's version, whether they are published or not, and `check` fails if they disagree. touchgate does not release pre-releases to PyPI yet, since PyPI writes them another way than Cargo.
 
 Use [`examples/pypi-release.yml`](examples/pypi-release.yml) as `.github/workflows/release.yml`, with your touchgate commit and key, and keep `touchgate.yml` as above. PyPI accepts no trusted publisher in a reusable workflow, and the attestations name the workflow that defines the job that publishes, so that job lives in your `release.yml`. Every step in it that does more than build or upload is a touchgate command:
 

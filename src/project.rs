@@ -1,24 +1,18 @@
-//! What a repository releases and where to, as its `touchgate.json` says.
+//! What a repository releases and where to, as its manifests show.
 //!
-//! Without a `touchgate.json`, a repository releases the published packages of
-//! its Cargo workspace to crates.io. A `touchgate.json` with
-//! `"registry": "pypi"` releases the Python package of its `pyproject.toml` to
-//! PyPI instead, and `"extension": "maturin"` adds the Cargo workspace that
-//! maturin builds the package's Rust extension from:
-//!
-//! ```json
-//! { "registry": "pypi", "extension": "maturin" }
-//! ```
+//! A repository with a `pyproject.toml` at its root that has a `[project]`
+//! table releases that Python package to PyPI. If maturin builds it, the Cargo
+//! workspace of its Rust extension moves with it. Any other repository
+//! releases the published packages of its Cargo workspace to crates.io.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use toml_edit::{DocumentMut, Item};
+
 use crate::python::PythonPackage;
 use crate::version::Version;
 use crate::workspace::{Members, Workspace};
-
-/// The file that says what a repository releases, at its root.
-const CONFIG_FILE: &str = "touchgate.json";
 
 /// Where a release is published.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -48,60 +42,46 @@ pub enum Extension {
     Maturin,
 }
 
-/// What `touchgate.json` says.
+/// What kind of release a repository makes.
 #[derive(Debug, PartialEq)]
-pub enum ReleaseConfig {
+enum ReleaseKind {
     CratesIo,
     PyPi { extension: Extension },
 }
 
-impl ReleaseConfig {
-    /// Reads `touchgate.json` at `root`, or the default of a repository
-    /// without one: its Cargo workspace, to crates.io.
-    fn load(root: &Path) -> Result<Self, Vec<String>> {
-        let path = root.join(CONFIG_FILE);
+impl ReleaseKind {
+    /// Reads the kind from the `pyproject.toml` at `root`, if there is one.
+    fn detect(root: &Path) -> Result<Self, Vec<String>> {
+        let path = root.join("pyproject.toml");
         match std::fs::read_to_string(&path) {
-            Ok(text) => Self::parse(&text).map_err(|error| vec![format!("{CONFIG_FILE}: {error}")]),
+            Ok(text) => Self::from_pyproject(&text)
+                .map_err(|error| vec![format!("{}: {error}", path.display())]),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::CratesIo),
             Err(error) => Err(vec![format!("{}: {error}", path.display())]),
         }
     }
 
-    fn parse(text: &str) -> Result<Self, String> {
-        let value: serde_json::Value =
-            serde_json::from_str(text).map_err(|error| format!("{error}"))?;
-        let object = value.as_object().ok_or("not a JSON object")?;
-        for key in object.keys() {
-            if !["registry", "extension"].contains(&key.as_str()) {
-                return Err(format!("unknown key `{key}`"));
-            }
+    /// A `pyproject.toml` without `[project]` only configures tools, as in a
+    /// Rust repository, and makes no Python release.
+    fn from_pyproject(text: &str) -> Result<Self, String> {
+        let document: DocumentMut = text.parse().map_err(|error| format!("{error}"))?;
+        if document
+            .get("project")
+            .and_then(Item::as_table_like)
+            .is_none()
+        {
+            return Ok(Self::CratesIo);
         }
-        let string = |key: &str| match object.get(key) {
-            None => Ok(None),
-            Some(item) => item
-                .as_str()
-                .map(Some)
-                .ok_or_else(|| format!("`{key}` is not a string")),
-        };
-        match (string("registry")?, string("extension")?) {
-            (Some("crates-io"), None) => Ok(Self::CratesIo),
-            (Some("crates-io"), Some(_)) => {
-                Err("`extension` is for a Python package, with `\"registry\": \"pypi\"`".to_owned())
-            }
-            (Some("pypi"), extension) => Ok(Self::PyPi {
-                extension: match extension {
-                    None => Extension::None,
-                    Some("maturin") => Extension::Maturin,
-                    Some(other) => {
-                        return Err(format!("`\"extension\": \"{other}\"` is not \"maturin\""));
-                    }
-                },
-            }),
-            (Some(other), _) => Err(format!(
-                "`\"registry\": \"{other}\"` is not \"crates-io\" or \"pypi\""
-            )),
-            (None, _) => Err("no `registry`".to_owned()),
-        }
+        let backend = document
+            .get("build-system")
+            .and_then(|build_system| build_system.get("build-backend"))
+            .and_then(Item::as_str);
+        Ok(Self::PyPi {
+            extension: match backend {
+                Some("maturin") => Extension::Maturin,
+                _ => Extension::None,
+            },
+        })
     }
 }
 
@@ -118,13 +98,12 @@ pub enum Project {
 }
 
 impl Project {
-    /// Reads `touchgate.json` at the root of the repository, and what it says
-    /// the repository releases.
+    /// Reads what the repository releases, as [`ReleaseKind::detect`] tells.
     pub fn load() -> Result<Self, Vec<String>> {
         let root = repository_root()?;
-        match ReleaseConfig::load(&root)? {
-            ReleaseConfig::CratesIo => Ok(Self::Crates(Workspace::load(Members::Published)?)),
-            ReleaseConfig::PyPi { extension } => Ok(Self::Python {
+        match ReleaseKind::detect(&root)? {
+            ReleaseKind::CratesIo => Ok(Self::Crates(Workspace::load(Members::Published)?)),
+            ReleaseKind::PyPi { extension } => Ok(Self::Python {
                 package: PythonPackage::load(&root)?,
                 extension: match extension {
                     Extension::None => None,
@@ -216,44 +195,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn configs() {
+    fn release_kinds() {
+        let python = "[project]\nname = \"frc\"\nversion = \"0.1.2\"\n";
         assert_eq!(
-            ReleaseConfig::parse(r#"{ "registry": "crates-io" }"#),
-            Ok(ReleaseConfig::CratesIo)
-        );
-        assert_eq!(
-            ReleaseConfig::parse(r#"{ "registry": "pypi" }"#),
-            Ok(ReleaseConfig::PyPi {
+            ReleaseKind::from_pyproject(python),
+            Ok(ReleaseKind::PyPi {
                 extension: Extension::None
             })
         );
         assert_eq!(
-            ReleaseConfig::parse(r#"{ "registry": "pypi", "extension": "maturin" }"#),
-            Ok(ReleaseConfig::PyPi {
+            ReleaseKind::from_pyproject(&format!(
+                "{python}[build-system]\nrequires = [\"maturin>=1.16,<2.0\"]\nbuild-backend = \"maturin\"\n"
+            )),
+            Ok(ReleaseKind::PyPi {
                 extension: Extension::Maturin
             })
         );
-        for (broken, expected) in [
-            ("{}", "no `registry`"),
-            ("[]", "not a JSON object"),
-            ("{", "EOF"),
-            (
-                r#"{ "registry": "npm" }"#,
-                r#"is not "crates-io" or "pypi""#,
-            ),
-            (
-                r#"{ "registry": "pypi", "extension": "pyo3" }"#,
-                r#"is not "maturin""#,
-            ),
-            (
-                r#"{ "registry": "crates-io", "extension": "maturin" }"#,
-                "is for a Python package",
-            ),
-            (r#"{ "registry": "pypi", "tag": "v" }"#, "unknown key `tag`"),
-            (r#"{ "registry": 1 }"#, "is not a string"),
-        ] {
-            let error = ReleaseConfig::parse(broken).unwrap_err();
-            assert!(error.contains(expected), "{broken:?}: {error}");
-        }
+        assert_eq!(
+            ReleaseKind::from_pyproject("[tool.ruff]\nline-length = 100\n"),
+            Ok(ReleaseKind::CratesIo)
+        );
+        assert!(ReleaseKind::from_pyproject("[project").is_err());
     }
 }
