@@ -96,8 +96,9 @@ Use [`examples/pypi-release.yml`](examples/pypi-release.yml) as `.github/workflo
 
 - `touchgate verify` checks the approval, as for crates.io.
 - `touchgate check` checks the version against the changelog before the build.
+- `touchgate check-backend` fails if `uv build` would download `uv_build` from PyPI rather than use the copy built into uv, which it does when the range in `build-system.requires` leaves out the running uv. The example pins uv with `UV_VERSION`, which then pins the backend too; when you move it past the range, widen the range. A package with another backend, such as maturin, passes: uv always downloads that one.
 - `touchgate wait-for-checks` waits for every check on the merge.
-- `touchgate publish dist` checks that `dist` holds only this version's wheels and sdist, signs a PEP 740 attestation for each with a pinned `pypi-attestations`, and uploads them with `uv publish` through Trusted Publishing, skipping files PyPI has already. It runs only in GitHub Actions, in a job with `id-token: write`. Updating touchgate updates how it signs and uploads.
+- `touchgate publish dist` checks that `dist` holds only this version's wheels and sdist, signs a PEP 740 attestation for each with `pypi-attestations`, which it installs from a lock built into touchgate that fixes every dependency by the hashes of its files, and uploads them with `uv publish` through Trusted Publishing, skipping files PyPI has already. It runs only in GitHub Actions, in a job with `id-token: write`. Updating touchgate updates how it signs and uploads.
 - `touchgate github-release --commit <hash> dist/*` tags the release and attaches the built files.
 
 The example builds with `uv build`. For maturin, build the wheels in the `build` job with [PyO3/maturin-action](https://github.com/PyO3/maturin-action) instead, in a matrix, and download them all into `dist`.

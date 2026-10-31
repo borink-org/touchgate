@@ -10,6 +10,8 @@ keywords = ["release", "publish", "fido2", "signing", "changelog"]
 categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
+# Reads the range of `uv_build` a Python package builds with.
+pep440_rs = "0.7.3"
 # Reads `cargo metadata`, for the workspace's packages and their versions.
 serde_json = "1.0.151"
 # Edits manifests without losing their formatting or comments.

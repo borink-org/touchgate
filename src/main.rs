@@ -28,6 +28,7 @@ const DEFAULT_MAX_AGE: &str = "1h";
 const USAGE: &str = "\
 usage:
   touchgate check
+  touchgate check-backend
   touchgate prepare <version> [--date YYYY-MM-DD] [--pull-request]
   touchgate check-entry <base revision>
   touchgate notes [<version>]
@@ -45,6 +46,7 @@ fn main() -> ExitCode {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
         ["check"] => check().map(|version| println!("{version}")),
+        ["check-backend"] => check_backend(),
         ["prepare", version, rest @ ..] => prepare(version, rest),
         ["check-entry", base] => check_entry(base),
         ["notes"] => notes(None),
@@ -85,6 +87,24 @@ fn check() -> Result<Version, Vec<String>> {
             "CHANGELOG.md: the newest release is {newest}, but the project is at {version}"
         )]),
         None => Err(vec!["CHANGELOG.md: no released section".to_owned()]),
+    }
+}
+
+/// Checks that `uv build` builds a Python package with the backend built into
+/// uv, if it builds with `uv_build`, as [`PythonPackage::check_build_backend`]
+/// describes.
+///
+/// [`PythonPackage::check_build_backend`]: python::PythonPackage::check_build_backend
+fn check_backend() -> Result<(), Vec<String>> {
+    match Project::load()? {
+        Project::Crates(_) => Err(vec![
+            "check-backend checks a Python package, and touchgate.json releases to crates.io"
+                .to_owned(),
+        ]),
+        Project::Python { package, .. } => {
+            println!("{}", package.check_build_backend()?);
+            Ok(())
+        }
     }
 }
 
