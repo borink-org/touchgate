@@ -34,7 +34,10 @@ target="$(uname -m)-unknown-linux-musl"
 version=$(gh api "repos/$repo/contents/Cargo.toml?ref=$commit" \
   -H 'Accept: application/vnd.github.raw' |
   sed -n 's/^version = "\(.*\)"$/\1/p' | head -n 1)
-tagged=$(gh api "repos/$repo/commits/v$version" --jq .sha 2>/dev/null || true)
+# gh prints the error body to stdout when there is no such tag.
+if ! tagged=$(gh api "repos/$repo/commits/v$version" --jq .sha 2>/dev/null); then
+  tagged=""
+fi
 if [[ $tagged != "$commit" ]]; then
   echo "::error::$commit is not a touchgate release: v$version names ${tagged:-no commit}. Pin the commit of a release, or set from-source"
   exit 1
