@@ -175,6 +175,20 @@ impl PythonPackage {
         let signed = crate::run(signer.command().arg("sign").args(&files));
         signer.remove();
         signed?;
+        // `uv publish` attaches an attestation only if it is among the paths
+        // it is given, beside its file.
+        let mut attestations = Vec::new();
+        for file in &files {
+            let attestation = publish_attestation(file);
+            if !attestation.is_file() {
+                return Err(vec![format!(
+                    "pypi-attestations wrote no {}",
+                    attestation.display()
+                )]);
+            }
+            attestations.push(attestation);
+        }
+        println!("signed {} attestations", attestations.len());
         let status = Command::new("uv")
             .args([
                 "publish",
@@ -184,6 +198,7 @@ impl PythonPackage {
                 PYPI_INDEX,
             ])
             .args(&files)
+            .args(&attestations)
             .status()
             .map_err(|error| vec![format!("uv publish: {error}")])?;
         if status.success() {
@@ -237,6 +252,14 @@ impl PythonPackage {
     }
 }
 
+/// Where `pypi-attestations sign` writes the attestation of `file`, the path
+/// `uv publish` pairs with it: `frc-0.1.2.tar.gz.publish.attestation`.
+fn publish_attestation(file: &Path) -> PathBuf {
+    let mut path = file.as_os_str().to_owned();
+    path.push(".publish.attestation");
+    PathBuf::from(path)
+}
+
 /// `name` as the file names of its wheels and sdists write it: lower case,
 /// with each run of `-`, `_` and `.` turned into one `_`.
 fn file_name_part(name: &str) -> String {
@@ -263,6 +286,14 @@ mod tests {
             version: Version::parse(version).unwrap(),
             manifest: PathBuf::from("pyproject.toml"),
         }
+    }
+
+    #[test]
+    fn attestation_paths() {
+        assert_eq!(
+            publish_attestation(Path::new("dist/frc-0.1.2.tar.gz")),
+            PathBuf::from("dist/frc-0.1.2.tar.gz.publish.attestation")
+        );
     }
 
     #[test]
