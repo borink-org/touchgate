@@ -4,6 +4,7 @@
 //!
 //! See the README for the release process these commands make up.
 
+mod actions;
 mod approval;
 mod changelog;
 mod github;
@@ -27,26 +28,29 @@ const DEFAULT_MAX_AGE: &str = "1h";
 
 const USAGE: &str = "\
 usage:
-  touchgate check
-  touchgate check-backend
+  touchgate check [--build]
   touchgate prepare <version> [--date YYYY-MM-DD] [--pull-request]
   touchgate check-entry <base revision>
   touchgate notes [<version>]
-  touchgate verify --repo <dir> --commit <hash> --branch <ref> --key <public key>
-                   --workflow-commit <hash>
+  touchgate verify [--repo <dir>] [--commit <hash>] [--branch <ref>]
+                   [--key <public key>] [--workflow-commit <hash>]
                    [--max-age <30m | 1h | 7d>]
   touchgate publish [<cargo publish arguments>... | <directory of built files>]
   touchgate approve [--key <private key>] [--no-push]
   touchgate start --commit <hash>
-  touchgate github-release --commit <hash> [<file to attach>...]
-  touchgate wait-for-checks --commit <hash> [--timeout <30m | 2h>]";
+  touchgate github-release [--commit <hash>] [<file to attach>...]
+  touchgate wait-for-checks [--commit <hash>] [--timeout <30m | 2h>]
+
+In a release run of GitHub Actions, --commit is the run's `commit` input,
+and verify takes --branch from the repository's default branch, --key from
+TOUCHGATE_KEY and --workflow-commit from GITHUB_WORKFLOW_SHA.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
         ["check"] => check().map(|version| println!("{version}")),
-        ["check-backend"] => check_backend(),
+        ["check", "--build"] => check_build(),
         ["prepare", version, rest @ ..] => prepare(version, rest),
         ["check-entry", base] => check_entry(base),
         ["notes"] => notes(None),
@@ -56,10 +60,10 @@ fn main() -> ExitCode {
         ["approve", rest @ ..] => approve(rest),
         ["start", "--commit", commit] => github::start(commit).map_err(|error| vec![error]),
         ["github-release", "--commit", commit, files @ ..] => github_release(commit, files),
-        ["wait-for-checks", "--commit", commit] => wait_for_checks(commit, DEFAULT_CHECKS_TIMEOUT),
-        ["wait-for-checks", "--commit", commit, "--timeout", timeout] => {
-            wait_for_checks(commit, timeout)
+        ["github-release", files @ ..] => {
+            release_commit().and_then(|commit| github_release(&commit, files))
         }
+        ["wait-for-checks", rest @ ..] => wait_for_checks(rest),
         _ => Err(vec![USAGE.to_owned()]),
     };
     match result {
@@ -90,22 +94,25 @@ fn check() -> Result<Version, Vec<String>> {
     }
 }
 
-/// Checks that `uv build` builds a Python package with the backend built into
-/// uv, if it builds with `uv_build`, as [`PythonPackage::check_build_backend`]
-/// describes.
+/// Does what [`check`] does, before a release is built. For a Python package,
+/// also checks that `uv build` builds it with the copy of `uv_build` in the
+/// uv on the `PATH`, as [`PythonPackage::check_build_backend`] describes.
 ///
 /// [`PythonPackage::check_build_backend`]: python::PythonPackage::check_build_backend
-fn check_backend() -> Result<(), Vec<String>> {
-    match Project::load()? {
-        Project::Crates(_) => Err(vec![
-            "check-backend checks a Python package, and touchgate.json releases to crates.io"
-                .to_owned(),
-        ]),
-        Project::Python { package, .. } => {
-            println!("{}", package.check_build_backend()?);
-            Ok(())
-        }
+fn check_build() -> Result<(), Vec<String>> {
+    let version = check()?;
+    if let Project::Python { package, .. } = Project::load()? {
+        println!("{}", package.check_build_backend()?);
     }
+    println!("{version}");
+    Ok(())
+}
+
+/// The merge commit the release run was started with.
+fn release_commit() -> Result<String, Vec<String>> {
+    actions::ReleaseRun::load()
+        .map(|run| run.commit)
+        .map_err(|error| vec![error])
 }
 
 /// Turns `## Unreleased` into the section of `version`, dated `--date` or
@@ -257,11 +264,32 @@ fn verify(args: &[&str]) -> Result<(), Vec<String>> {
         };
         *slot = Some(*args.next().ok_or_else(|| vec![USAGE.to_owned()])?);
     }
-    let (Some(repo), Some(commit), Some(branch), Some(key), Some(workflow)) =
-        (repo, commit, branch, key, workflow)
-    else {
-        return Err(vec![USAGE.to_owned()]);
+    // What no flag gives comes from the release run, read only if needed.
+    let run = if commit.is_none() || branch.is_none() {
+        Some(actions::ReleaseRun::load().map_err(|error| vec![error])?)
+    } else {
+        None
     };
+    let from_run = |field: fn(&actions::ReleaseRun) -> &String| {
+        run.as_ref().map(field).cloned().unwrap_or_default()
+    };
+    let commit = commit.map_or_else(|| from_run(|run| &run.commit), str::to_owned);
+    let branch = branch.map_or_else(|| from_run(|run| &run.branch), str::to_owned);
+    let key = match key {
+        Some(key) => key.to_owned(),
+        None => actions::approval_key().map_err(|error| vec![error])?,
+    };
+    let workflow = match workflow {
+        Some(workflow) => workflow.to_owned(),
+        None => actions::workflow_commit().map_err(|error| vec![error])?,
+    };
+    let (repo, commit, branch, key, workflow) = (
+        repo.unwrap_or("."),
+        commit.as_str(),
+        branch.as_str(),
+        key.as_str(),
+        workflow.as_str(),
+    );
     if !approval::is_hash(workflow) {
         return Err(vec![format!("`{workflow}` is not a full commit hash")]);
     }
@@ -278,9 +306,26 @@ const DEFAULT_CHECKS_TIMEOUT: &str = "2h";
 
 /// Waits for every check on `commit` to pass, as [`github::wait_for_checks`]
 /// describes.
-fn wait_for_checks(commit: &str, timeout: &str) -> Result<(), Vec<String>> {
-    let timeout = approval::parse_age(timeout).map_err(|error| vec![error])?;
-    github::wait_for_checks(commit, timeout).map_err(|error| vec![error])
+/// Waits for every check on `--commit`, or on the release run's commit, as
+/// [`github::wait_for_checks`] describes.
+fn wait_for_checks(args: &[&str]) -> Result<(), Vec<String>> {
+    let (mut commit, mut timeout) = (None, None);
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        let slot = match *flag {
+            "--commit" => &mut commit,
+            "--timeout" => &mut timeout,
+            _ => return Err(vec![USAGE.to_owned()]),
+        };
+        *slot = Some(*args.next().ok_or_else(|| vec![USAGE.to_owned()])?);
+    }
+    let commit = match commit {
+        Some(commit) => commit.to_owned(),
+        None => release_commit()?,
+    };
+    let timeout = approval::parse_age(timeout.unwrap_or(DEFAULT_CHECKS_TIMEOUT))
+        .map_err(|error| vec![error])?;
+    github::wait_for_checks(&commit, timeout).map_err(|error| vec![error])
 }
 
 /// The release key unless `--key` names another: the handle `ssh-keygen`

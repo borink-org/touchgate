@@ -332,9 +332,16 @@ fn tagged_commit(tag: &str) -> Result<Option<String>, String> {
 }
 
 /// Runs `gh`, and returns its standard output, or its standard error as the
-/// error.
+/// error. In GitHub Actions, `gh` works on the repository of the run unless
+/// `GH_REPO` names another, also in a job without a checkout.
 fn gh(args: &[&str]) -> Result<String, String> {
-    output("gh", Command::new("gh").args(args))
+    let mut command = Command::new("gh");
+    if std::env::var_os("GH_REPO").is_none()
+        && let Some(repository) = std::env::var_os("GITHUB_REPOSITORY")
+    {
+        command.env("GH_REPO", repository);
+    }
+    output("gh", command.args(args))
 }
 
 fn git(args: &[&str]) -> Result<String, String> {

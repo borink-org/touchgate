@@ -44,6 +44,8 @@ on:
   push:
     branches: [main]
   pull_request:
+    # The three default types, and a label change, so that adding no-changelog
+    # runs the changelog check again.
     types: [opened, synchronize, reopened, labeled, unlabeled]
 permissions: {}
 jobs:
@@ -95,11 +97,10 @@ touchgate then releases the package of `pyproject.toml`, whose `project.version`
 Use [`examples/pypi-release.yml`](examples/pypi-release.yml) as `.github/workflows/release.yml`, with your touchgate commit and key, and keep `touchgate.yml` as above. PyPI accepts no trusted publisher in a reusable workflow, and the attestations name the workflow that defines the job that publishes, so that job lives in your `release.yml`. Every step in it that does more than build or upload is a touchgate command:
 
 - `touchgate verify` checks the approval, as for crates.io.
-- `touchgate check` checks the version against the changelog before the build.
-- `touchgate check-backend` fails if `uv build` would download `uv_build` from PyPI rather than use the copy built into uv, which it does when the range in `build-system.requires` leaves out the running uv. The example pins uv with `UV_VERSION`, which then pins the backend too; when you move it past the range, widen the range. A package with another backend, such as maturin, passes: uv always downloads that one.
+- `touchgate check --build` checks the version against the changelog before the build. For a Python package, it also fails if `uv build` would download `uv_build` from PyPI rather than use the copy built into uv, which it does when the range in `build-system.requires` leaves out the running uv. The example pins uv with `UV_VERSION`, which then pins the backend too; when you move it past the range, widen the range. A package with another backend, such as maturin, passes: uv always downloads that one.
 - `touchgate wait-for-checks` waits for every check on the merge.
 - `touchgate publish dist` checks that `dist` holds only this version's wheels and sdist, signs a PEP 740 attestation for each with `pypi-attestations`, which it installs from a lock built into touchgate that fixes every dependency by the hashes of its files, and uploads them with `uv publish` through Trusted Publishing, skipping files PyPI has already. It runs only in GitHub Actions, in a job with `id-token: write`. Updating touchgate updates how it signs and uploads.
-- `touchgate github-release --commit <hash> dist/*` tags the release and attaches the built files.
+- `touchgate github-release dist/*` tags the release and attaches the built files.
 
 The example builds with `uv build`. For maturin, build the wheels in the `build` job with [PyO3/maturin-action](https://github.com/PyO3/maturin-action) instead, in a matrix, and download them all into `dist`.
 
