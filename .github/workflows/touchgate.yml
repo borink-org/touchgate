@@ -52,6 +52,10 @@ jobs:
         run: >-
           cargo install --locked --root "$RUNNER_TEMP/touchgate"
           --git https://github.com/borink-org/touchgate --rev "$TOUCHGATE_REV" touchgate
+      # For a Python package, preparing a release moves uv.lock along.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
       - name: Prepare the release and open its pull request
         env:
           VERSION: ${{ inputs.version }}

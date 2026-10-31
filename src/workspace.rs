@@ -2,7 +2,9 @@
 //! give them a new version.
 //!
 //! touchgate releases every published package of a workspace together, at one
-//! version.
+//! version. For a Python package built with maturin, every package of the
+//! workspace moves with the Python package's version instead, published or
+//! not.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -33,11 +35,23 @@ impl Package {
 pub struct Workspace {
     pub root: PathBuf,
     pub packages: Vec<Package>,
+    /// The packages whose version the release sets.
+    pub released: Members,
+}
+
+/// Which packages of a workspace a release moves to its version.
+#[derive(Clone, Copy)]
+pub enum Members {
+    /// The packages published to a registry, for a release to crates.io.
+    Published,
+    /// Every package, for a Python package built from the workspace, which
+    /// publishes none of them to crates.io.
+    All,
 }
 
 impl Workspace {
     /// Reads the workspace with `cargo metadata`.
-    pub fn load() -> Result<Self, Vec<String>> {
+    pub fn load(released: Members) -> Result<Self, Vec<String>> {
         let output = crate::run(Command::new("cargo").args([
             "metadata",
             "--format-version",
@@ -78,6 +92,7 @@ impl Workspace {
             Ok(Self {
                 root: PathBuf::from(root),
                 packages,
+                released,
             })
         } else {
             Err(errors)
@@ -89,17 +104,33 @@ impl Workspace {
         self.packages.iter().filter(|package| package.published)
     }
 
-    /// The version every published package is at.
+    /// The packages whose version the release sets.
+    pub fn released(&self) -> impl Iterator<Item = &Package> {
+        self.packages
+            .iter()
+            .filter(move |package| match self.released {
+                Members::Published => package.published,
+                Members::All => true,
+            })
+    }
+
+    /// The version every released package is at.
     pub fn version(&self) -> Result<&Version, Vec<String>> {
-        let mut published = self.published();
-        let first = published
-            .next()
-            .ok_or_else(|| vec!["the workspace publishes no package".to_owned()])?;
-        let errors: Vec<String> = published
+        let mut released = self.released();
+        let first = released.next().ok_or_else(|| {
+            vec![
+                match self.released {
+                    Members::Published => "the workspace publishes no package",
+                    Members::All => "the workspace has no package",
+                }
+                .to_owned(),
+            ]
+        })?;
+        let errors: Vec<String> = released
             .filter(|package| package.version != first.version)
             .map(|package| {
                 format!(
-                    "{} is at {}, but {} is at {}. touchgate releases every published package at one version",
+                    "{} is at {}, but {} is at {}. touchgate releases these packages at one version",
                     package.name, package.version, first.name, first.version
                 )
             })
@@ -111,12 +142,12 @@ impl Workspace {
         }
     }
 
-    /// Sets `new` as the version of every published package, and in every
+    /// Sets `new` as the version of every released package, and in every
     /// requirement on one that names the current version. Then lets Cargo
     /// bring `Cargo.lock` along.
     pub fn set_version(&self, new: &Version) -> Result<(), Vec<String>> {
         let old = self.version()?.clone();
-        let published: HashSet<&str> = self.published().map(|p| p.name.as_str()).collect();
+        let released: HashSet<&str> = self.released().map(|p| p.name.as_str()).collect();
         let root_manifest = self.root.join("Cargo.toml");
 
         let mut documents = BTreeMap::new();
@@ -132,7 +163,7 @@ impl Workspace {
         }
 
         let mut inherited = false;
-        for package in self.published() {
+        for package in self.released() {
             let document = documents.get_mut(&package.manifest).expect("read above");
             let version = &mut document["package"]["version"];
             if version.is_str() {
@@ -161,7 +192,7 @@ impl Workspace {
         for document in documents.values_mut() {
             let table = document.as_table_mut();
             for tables in dependency_tables(table) {
-                bump_requirements(tables, &published, &old, new);
+                bump_requirements(tables, &released, &old, new);
             }
         }
 
@@ -173,11 +204,11 @@ impl Workspace {
         // `Cargo.lock` to the new version, and upgrades nothing else.
         crate::run(Command::new("cargo").args(["metadata", "--format-version", "1"]))?;
 
-        let updated = Self::load()?;
+        let updated = Self::load(self.released)?;
         let version = updated.version()?;
         if version != new {
             return Err(vec![format!(
-                "the published packages are at {version} after the edit, not {new}"
+                "the released packages are at {version} after the edit, not {new}"
             )]);
         }
         Ok(())
@@ -222,12 +253,12 @@ fn dependency_tables(manifest: &mut toml_edit::Table) -> Vec<&mut dyn TableLike>
     tables
 }
 
-/// Moves each requirement on a published package from `old` to `new`, where it
+/// Moves each requirement on a released package from `old` to `new`, where it
 /// names `old` exactly. A wider requirement, such as `0.4`, is left to hold or
 /// fail when Cargo resolves the workspace.
 fn bump_requirements(
     table: &mut dyn TableLike,
-    published: &HashSet<&str>,
+    released: &HashSet<&str>,
     old: &Version,
     new: &Version,
 ) {
@@ -237,7 +268,7 @@ fn bump_requirements(
             .and_then(Item::as_str)
             .unwrap_or(key.get())
             .to_owned();
-        if !published.contains(name.as_str()) {
+        if !released.contains(name.as_str()) {
             continue;
         }
         let requirement = if dependency.is_str() {
