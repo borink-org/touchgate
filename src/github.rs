@@ -7,6 +7,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::approval;
+use crate::project::Registry;
 use crate::version::Version;
 
 /// The branch a prepared release is proposed from.
@@ -85,8 +86,9 @@ impl GitHubRelease {
 
 /// Commits the prepared release on its branch, pushes it, and opens a pull
 /// request for it, or updates the one that is open. `changelog` is the
-/// changelog's path in the repository.
-pub fn pull_request(version: &Version, changelog: &str) -> Result<(), String> {
+/// changelog's path in the repository, and `registry` where the release
+/// publishes to.
+pub fn pull_request(version: &Version, changelog: &str, registry: Registry) -> Result<(), String> {
     let release = GitHubRelease::of(version, changelog)?;
     let branch = release_branch(version);
     git(&["switch", "--create", &branch])?;
@@ -109,7 +111,7 @@ pub fn pull_request(version: &Version, changelog: &str) -> Result<(), String> {
     ])?;
 
     let body = format!(
-        "This sets every published package to {version} and dates its section of the changelog.
+        "This sets what the project releases to {version} and dates its section of the changelog.
 
 To approve the release, check out this branch, look it over, and once the checks pass run `touchgate approve`. It signs an empty commit with the release key, which asks for its PIN and a touch, and pushes it.
 
@@ -121,12 +123,13 @@ touchgate approve
 
 The approval names the commit of the `publish` branch the release is to run from; if that branch changes before the release, approve again. Pushing the approval also starts this pull request's checks, which a pull request opened by a workflow does not start on its own. An approval lasts an hour, so merge once they pass; if the hour runs out, approve again.
 
-Merge with a merge commit, never by squashing or rebasing, which would drop the signature. The release then publishes to crates.io, and tags and releases {version} on GitHub once that succeeds. If the default branch moves before the merge, merge it into this branch and approve again, since a release publishes only the exact tree that was approved.
+Merge with a merge commit, never by squashing or rebasing, which would drop the signature. The release then publishes to {registry}, and tags and releases {version} on GitHub once that succeeds. If the default branch moves before the merge, merge it into this branch and approve again, since a release publishes only the exact tree that was approved.
 
 ## The GitHub release
 
 {preview}",
-        preview = release.preview()
+        preview = release.preview(),
+        registry = registry.name()
     );
     let title = format!("Release {version}.");
     match gh(&[
@@ -141,13 +144,18 @@ Merge with a merge commit, never by squashing or rebasing, which would drop the 
 }
 
 /// Tags `commit` and makes its GitHub release, as [`GitHubRelease::of`]
-/// describes it.
+/// describes it, with `files` attached.
 ///
 /// Anyone who can push can make tags and releases, so a tag or a release that
 /// exists already must point at `commit`, or this fails rather than dress up
 /// someone else's. A release this made before, on a run that failed later,
 /// counts as done.
-pub fn release(commit: &str, version: &Version, changelog: &str) -> Result<(), String> {
+pub fn release(
+    commit: &str,
+    version: &Version,
+    changelog: &str,
+    files: &[&str],
+) -> Result<(), String> {
     if !approval::is_hash(commit) {
         return Err(format!("`{commit}` is not a full commit hash"));
     }
@@ -192,6 +200,9 @@ pub fn release(commit: &str, version: &Version, changelog: &str) -> Result<(), S
     if release.pre_release {
         args.push("--prerelease");
     }
+    // After the options, so that no file name reads as one.
+    args.push("--");
+    args.extend(files);
     gh(&args)?;
 
     match tagged_commit(tag)? {
@@ -321,9 +332,16 @@ fn tagged_commit(tag: &str) -> Result<Option<String>, String> {
 }
 
 /// Runs `gh`, and returns its standard output, or its standard error as the
-/// error.
+/// error. In GitHub Actions, `gh` works on the repository of the run unless
+/// `GH_REPO` names another, also in a job without a checkout.
 fn gh(args: &[&str]) -> Result<String, String> {
-    output("gh", Command::new("gh").args(args))
+    let mut command = Command::new("gh");
+    if std::env::var_os("GH_REPO").is_none()
+        && let Some(repository) = std::env::var_os("GITHUB_REPOSITORY")
+    {
+        command.env("GH_REPO", repository);
+    }
+    output("gh", command.args(args))
 }
 
 fn git(args: &[&str]) -> Result<String, String> {

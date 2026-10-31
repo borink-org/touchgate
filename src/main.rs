@@ -1,19 +1,23 @@
-//! Prepares the release of a Cargo workspace from a hand-written changelog,
-//! and lets CI publish it only after a person approved it with a hardware
-//! key, by touch and PIN.
+//! Prepares the release of a Cargo workspace or a Python package from a
+//! hand-written changelog, and lets CI publish it only after a person approved
+//! it with a hardware key, by touch and PIN.
 //!
 //! See the README for the release process these commands make up.
 
+mod actions;
 mod approval;
 mod changelog;
 mod github;
+mod project;
+mod python;
 mod version;
 mod workspace;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 use changelog::Changelog;
+use project::Project;
 use version::{Date, Version};
 use workspace::Workspace;
 
@@ -24,24 +28,29 @@ const DEFAULT_MAX_AGE: &str = "1h";
 
 const USAGE: &str = "\
 usage:
-  touchgate check
+  touchgate check [--build]
   touchgate prepare <version> [--date YYYY-MM-DD] [--pull-request]
   touchgate check-entry <base revision>
   touchgate notes [<version>]
-  touchgate verify --repo <dir> --commit <hash> --branch <ref> --key <public key>
-                   --workflow-commit <hash>
+  touchgate verify [--repo <dir>] [--commit <hash>] [--branch <ref>]
+                   [--key <public key>] [--workflow-commit <hash>]
                    [--max-age <30m | 1h | 7d>]
-  touchgate publish [<cargo publish arguments>...]
+  touchgate publish [<cargo publish arguments>... | <directory of built files>]
   touchgate approve [--key <private key>] [--no-push]
   touchgate start --commit <hash>
-  touchgate github-release --commit <hash>
-  touchgate wait-for-checks --commit <hash> [--timeout <30m | 2h>]";
+  touchgate github-release [--commit <hash>] [<file to attach>...]
+  touchgate wait-for-checks [--commit <hash>] [--timeout <30m | 2h>]
+
+In a release run of GitHub Actions, --commit is the run's `commit` input,
+and verify takes --branch from the repository's default branch, --key from
+TOUCHGATE_KEY and --workflow-commit from GITHUB_WORKFLOW_SHA.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
         ["check"] => check().map(|version| println!("{version}")),
+        ["check", "--build"] => check_build(),
         ["prepare", version, rest @ ..] => prepare(version, rest),
         ["check-entry", base] => check_entry(base),
         ["notes"] => notes(None),
@@ -50,11 +59,11 @@ fn main() -> ExitCode {
         ["publish", rest @ ..] => publish(rest),
         ["approve", rest @ ..] => approve(rest),
         ["start", "--commit", commit] => github::start(commit).map_err(|error| vec![error]),
-        ["github-release", "--commit", commit] => github_release(commit),
-        ["wait-for-checks", "--commit", commit] => wait_for_checks(commit, DEFAULT_CHECKS_TIMEOUT),
-        ["wait-for-checks", "--commit", commit, "--timeout", timeout] => {
-            wait_for_checks(commit, timeout)
+        ["github-release", "--commit", commit, files @ ..] => github_release(commit, files),
+        ["github-release", files @ ..] => {
+            release_commit().and_then(|commit| github_release(&commit, files))
         }
+        ["wait-for-checks", rest @ ..] => wait_for_checks(rest),
         _ => Err(vec![USAGE.to_owned()]),
     };
     match result {
@@ -69,24 +78,45 @@ fn main() -> ExitCode {
 }
 
 /// Checks that the changelog has the shape [`Changelog::parse`] describes,
-/// that the published packages share one version, and that the newest
+/// that what the project releases is at one version, and that the newest
 /// released section of the changelog is that version. Returns the version.
 fn check() -> Result<Version, Vec<String>> {
-    let workspace = Workspace::load()?;
-    let version = workspace.version()?.clone();
-    let text = read(&changelog_path(&workspace))?;
+    let project = Project::load()?;
+    let version = project.version()?;
+    let text = read(&changelog_path(&project))?;
     let changelog = Changelog::parse(&text)?;
     match changelog.newest_release() {
         Some((newest, _)) if *newest == version => Ok(version),
         Some((newest, _)) => Err(vec![format!(
-            "CHANGELOG.md: the newest release is {newest}, but the published packages are at {version}"
+            "CHANGELOG.md: the newest release is {newest}, but the project is at {version}"
         )]),
         None => Err(vec!["CHANGELOG.md: no released section".to_owned()]),
     }
 }
 
+/// Does what [`check`] does, before a release is built. For a Python package,
+/// also checks that `uv build` builds it with the copy of `uv_build` in the
+/// uv on the `PATH`, as [`PythonPackage::check_build_backend`] describes.
+///
+/// [`PythonPackage::check_build_backend`]: python::PythonPackage::check_build_backend
+fn check_build() -> Result<(), Vec<String>> {
+    let version = check()?;
+    if let Project::Python { package, .. } = Project::load()? {
+        println!("{}", package.check_build_backend()?);
+    }
+    println!("{version}");
+    Ok(())
+}
+
+/// The merge commit the release run was started with.
+fn release_commit() -> Result<String, Vec<String>> {
+    actions::ReleaseRun::load()
+        .map(|run| run.commit)
+        .map_err(|error| vec![error])
+}
+
 /// Turns `## Unreleased` into the section of `version`, dated `--date` or
-/// today, and sets `version` on every published package. With
+/// today, and sets `version` on what the project releases. With
 /// `--pull-request`, also commits that on `release/<version>`, pushes it and
 /// opens a pull request.
 fn prepare(version: &str, args: &[&str]) -> Result<(), Vec<String>> {
@@ -105,28 +135,32 @@ fn prepare(version: &str, args: &[&str]) -> Result<(), Vec<String>> {
     }
     let date = date.unwrap_or_else(Date::today);
     check()?;
-    let workspace = Workspace::load()?;
-    let path = changelog_path(&workspace);
+    let project = Project::load()?;
+    let path = changelog_path(&project);
     let text = read(&path)?;
     let released = Changelog::parse(&text)?
         .release(&version, date)
         .map_err(|error| vec![error])?;
     std::fs::write(&path, released)
         .map_err(|error| vec![format!("{}: {error}", path.display())])?;
-    workspace.set_version(&version)?;
+    project.set_version(&version)?;
     let checked = check()?;
     assert_eq!(checked, version);
     println!("{version}");
     if pull_request {
-        github::pull_request(&version, &changelog_in_repository(&workspace)?)
-            .map_err(|error| vec![error])?;
+        github::pull_request(
+            &version,
+            &changelog_in_repository(&project)?,
+            project.registry(),
+        )
+        .map_err(|error| vec![error])?;
     }
     Ok(())
 }
 
 /// Tags the release at `commit`, the checkout, and makes its GitHub release
-/// with its section of the changelog as the notes.
-fn github_release(commit: &str) -> Result<(), Vec<String>> {
+/// with its section of the changelog as the notes, and `files` attached.
+fn github_release(commit: &str, files: &[&str]) -> Result<(), Vec<String>> {
     let version = check()?;
     let head = run(Command::new("git").args(["rev-parse", "--verify", "HEAD^{commit}"]))?;
     if head.trim_end() != commit {
@@ -135,14 +169,14 @@ fn github_release(commit: &str) -> Result<(), Vec<String>> {
             head.trim_end()
         )]);
     }
-    let changelog = changelog_in_repository(&Workspace::load()?)?;
-    github::release(commit, &version, &changelog).map_err(|error| vec![error])
+    let changelog = changelog_in_repository(&Project::load()?)?;
+    github::release(commit, &version, &changelog, files).map_err(|error| vec![error])
 }
 
-/// Fails if the changes since `base` touch a published package but add
+/// Fails if the changes since `base` touch what the project releases but add
 /// nothing under `## Unreleased`.
 fn check_entry(base: &str) -> Result<(), Vec<String>> {
-    let workspace = Workspace::load()?;
+    let project = Project::load()?;
     let top =
         PathBuf::from(run(Command::new("git").args(["rev-parse", "--show-toplevel"]))?.trim_end());
     let changed = run(Command::new("git").args([
@@ -151,21 +185,18 @@ fn check_entry(base: &str) -> Result<(), Vec<String>> {
         "--end-of-options",
         &format!("{base}...HEAD"),
     ]))?;
-    let touched: Vec<&str> = workspace
-        .published()
-        .filter(|package| {
-            changed
-                .lines()
-                .any(|path| top.join(path).starts_with(package.dir()))
-        })
-        .map(|package| package.name.as_str())
+    let touched: Vec<&str> = project
+        .released_dirs()
+        .into_iter()
+        .filter(|(_, dir)| changed.lines().any(|path| top.join(path).starts_with(dir)))
+        .map(|(name, _)| name)
         .collect();
     if touched.is_empty() {
-        println!("no published package changed");
+        println!("nothing released changed");
         return Ok(());
     }
 
-    let path = changelog_path(&workspace);
+    let path = changelog_path(&project);
     let relative = path.strip_prefix(&top).unwrap_or(&path);
     let relative = relative
         .to_str()
@@ -174,6 +205,8 @@ fn check_entry(base: &str) -> Result<(), Vec<String>> {
     // A base from before the changelog existed has no entries.
     let exists = Command::new("git")
         .args(["cat-file", "-e", &at_base])
+        // A missing file is an answer here, not an error to show.
+        .stderr(Stdio::null())
         .status()
         .map_err(|error| vec![format!("git: {error}")])?
         .success();
@@ -200,12 +233,12 @@ fn check_entry(base: &str) -> Result<(), Vec<String>> {
 /// Prints the section of `version`, or of the current version, for the notes
 /// of a release.
 fn notes(version: Option<&str>) -> Result<(), Vec<String>> {
-    let workspace = Workspace::load()?;
+    let project = Project::load()?;
     let version = match version {
         Some(version) => Version::parse(version).map_err(|error| vec![error])?,
-        None => workspace.version()?.clone(),
+        None => project.version()?,
     };
-    let text = read(&changelog_path(&workspace))?;
+    let text = read(&changelog_path(&project))?;
     let notes = Changelog::parse(&text)?
         .notes(&version)
         .ok_or_else(|| vec![format!("CHANGELOG.md: no section for {version}")])?;
@@ -231,11 +264,32 @@ fn verify(args: &[&str]) -> Result<(), Vec<String>> {
         };
         *slot = Some(*args.next().ok_or_else(|| vec![USAGE.to_owned()])?);
     }
-    let (Some(repo), Some(commit), Some(branch), Some(key), Some(workflow)) =
-        (repo, commit, branch, key, workflow)
-    else {
-        return Err(vec![USAGE.to_owned()]);
+    // What no flag gives comes from the release run, read only if needed.
+    let run = if commit.is_none() || branch.is_none() {
+        Some(actions::ReleaseRun::load().map_err(|error| vec![error])?)
+    } else {
+        None
     };
+    let from_run = |field: fn(&actions::ReleaseRun) -> &String| {
+        run.as_ref().map(field).cloned().unwrap_or_default()
+    };
+    let commit = commit.map_or_else(|| from_run(|run| &run.commit), str::to_owned);
+    let branch = branch.map_or_else(|| from_run(|run| &run.branch), str::to_owned);
+    let key = match key {
+        Some(key) => key.to_owned(),
+        None => actions::approval_key().map_err(|error| vec![error])?,
+    };
+    let workflow = match workflow {
+        Some(workflow) => workflow.to_owned(),
+        None => actions::workflow_commit().map_err(|error| vec![error])?,
+    };
+    let (repo, commit, branch, key, workflow) = (
+        repo.unwrap_or("."),
+        commit.as_str(),
+        branch.as_str(),
+        key.as_str(),
+        workflow.as_str(),
+    );
     if !approval::is_hash(workflow) {
         return Err(vec![format!("`{workflow}` is not a full commit hash")]);
     }
@@ -252,9 +306,26 @@ const DEFAULT_CHECKS_TIMEOUT: &str = "2h";
 
 /// Waits for every check on `commit` to pass, as [`github::wait_for_checks`]
 /// describes.
-fn wait_for_checks(commit: &str, timeout: &str) -> Result<(), Vec<String>> {
-    let timeout = approval::parse_age(timeout).map_err(|error| vec![error])?;
-    github::wait_for_checks(commit, timeout).map_err(|error| vec![error])
+/// Waits for every check on `--commit`, or on the release run's commit, as
+/// [`github::wait_for_checks`] describes.
+fn wait_for_checks(args: &[&str]) -> Result<(), Vec<String>> {
+    let (mut commit, mut timeout) = (None, None);
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        let slot = match *flag {
+            "--commit" => &mut commit,
+            "--timeout" => &mut timeout,
+            _ => return Err(vec![USAGE.to_owned()]),
+        };
+        *slot = Some(*args.next().ok_or_else(|| vec![USAGE.to_owned()])?);
+    }
+    let commit = match commit {
+        Some(commit) => commit.to_owned(),
+        None => release_commit()?,
+    };
+    let timeout = approval::parse_age(timeout.unwrap_or(DEFAULT_CHECKS_TIMEOUT))
+        .map_err(|error| vec![error])?;
+    github::wait_for_checks(&commit, timeout).map_err(|error| vec![error])
 }
 
 /// The release key unless `--key` names another: the handle `ssh-keygen`
@@ -359,11 +430,30 @@ fn approve(args: &[&str]) -> Result<(), Vec<String>> {
     Ok(())
 }
 
-/// Publishes every published package whose version is not on crates.io yet,
-/// so that a release that failed halfway can run again.
-fn publish(cargo_args: &[&str]) -> Result<(), Vec<String>> {
-    let workspace = Workspace::load()?;
-    workspace.version()?;
+/// Publishes what the project releases to its registry, skipping what is
+/// there already, so that a release that failed halfway can run again.
+///
+/// To crates.io, `args` go to `cargo publish`. To PyPI, `args` is the
+/// directory of the built files, `dist` unless it names another.
+fn publish(args: &[&str]) -> Result<(), Vec<String>> {
+    let project = Project::load()?;
+    project.version()?;
+    match &project {
+        Project::Crates(workspace) => publish_crates(workspace, args),
+        Project::Python { package, .. } => {
+            let dist = match args {
+                [] => "dist",
+                [dist] => dist,
+                _ => return Err(vec![USAGE.to_owned()]),
+            };
+            package.publish(Path::new(dist))
+        }
+    }
+}
+
+/// Publishes every published package of `workspace` whose version is not on
+/// crates.io yet.
+fn publish_crates(workspace: &Workspace, cargo_args: &[&str]) -> Result<(), Vec<String>> {
     let mut existing = Vec::new();
     for package in workspace.published() {
         let url = format!(
@@ -416,10 +506,10 @@ fn publish(cargo_args: &[&str]) -> Result<(), Vec<String>> {
 }
 
 /// The changelog's path in the git repository, which a link on GitHub names.
-fn changelog_in_repository(workspace: &Workspace) -> Result<String, Vec<String>> {
+fn changelog_in_repository(project: &Project) -> Result<String, Vec<String>> {
     let top =
         PathBuf::from(run(Command::new("git").args(["rev-parse", "--show-toplevel"]))?.trim_end());
-    let path = changelog_path(workspace);
+    let path = changelog_path(project);
     let relative = path.strip_prefix(&top).unwrap_or(&path);
     relative
         .to_str()
@@ -427,9 +517,9 @@ fn changelog_in_repository(workspace: &Workspace) -> Result<String, Vec<String>>
         .ok_or_else(|| vec![format!("{} is not a UTF-8 path", relative.display())])
 }
 
-/// The changelog, at the root of the workspace.
-fn changelog_path(workspace: &Workspace) -> PathBuf {
-    workspace.root.join("CHANGELOG.md")
+/// The changelog, at the root of the project.
+fn changelog_path(project: &Project) -> PathBuf {
+    project.root().join("CHANGELOG.md")
 }
 
 /// Runs `command` and returns its standard output, or its standard error as
