@@ -1,6 +1,6 @@
 [package]
 name = "touchgate"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Prepares Cargo and Python releases, and lets CI publish one only after a hardware key approved it with a touch and a PIN"
