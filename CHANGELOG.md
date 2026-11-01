@@ -12,8 +12,7 @@
 
 ### Changed
 
-- The reusable workflow for a Cargo workspace is `crates-release.yml`, no longer `release.yml`, which is now touchgate's own release. Callers pinned to an earlier commit keep working.
-- The jobs of the reusable `touchgate.yml` install touchgate with the install action instead of building it.
+- touchgate has no reusable workflows any more. A repository copies `examples/touchgate.yml` and `examples/crates-release.yml` or `examples/pypi-release.yml`, which install touchgate with the install action instead of building it. Callers pinned to an earlier commit keep working.
 
 ### Fixed
 

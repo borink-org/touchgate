@@ -1,0 +1,124 @@
+# The release of a Cargo workspace to crates.io, for
+# `.github/workflows/release.yml` on the default branch and on `publish`.
+# Replace the touchgate commit, that of a release, and the approval key, the
+# contents of your `.pub` file. The install action downloads that release's
+# binary and checks its attestation.
+#
+# Every step that does more than build or upload is a touchgate command, so
+# this file stays the same from project to project. crates.io trusts this file
+# in the `release` environment.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: The merge commit of the release, on the default branch
+        required: true
+        type: string
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  # The approval key `touchgate verify` checks the approval against.
+  TOUCHGATE_KEY: sk-ssh-ed25519@openssh.com AAAA... release key
+
+jobs:
+  # Checks the approval without running anything from the commit, because
+  # until this passes the commit is untrusted: a `rust-toolchain.toml`, a
+  # `.cargo/config.toml` or a build script in it could make the check pass.
+  # touchgate is installed before the checkout, and reads the commit with git
+  # alone.
+  verify:
+    name: Check the approval
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # to fetch the default branch
+    steps:
+      - uses: borink-org/touchgate/install@0000000000000000000000000000000000000000 # v0.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      # Reads the commit, the default branch and this workflow's commit from
+      # the run, and the key from TOUCHGATE_KEY.
+      - run: touchgate verify
+
+  # The commit is approved from here on, so building it is safe. The build
+  # runs apart from the job that can get a crates.io token: every step of a
+  # job allowed `id-token: write` can ask for that token, and building runs
+  # the build scripts and procedural macros of every dependency.
+  build:
+    name: Build the release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # to check out the release
+    steps:
+      - uses: borink-org/touchgate/install@0000000000000000000000000000000000000000 # v0.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+      - run: touchgate check
+      - run: cargo publish --workspace --locked --dry-run
+
+  # Publishes only once every check on the merge commit has passed.
+  checks:
+    name: Wait for the merge's checks
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      checks: read # to read the merge commit's check runs
+    steps:
+      - uses: borink-org/touchgate/install@0000000000000000000000000000000000000000 # v0.1.0
+      - run: touchgate wait-for-checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # Compiles nothing: `--no-verify` packages and uploads the checked-out
+  # sources, which the build job built, and `cargo metadata` runs no build
+  # script.
+  publish:
+    name: Publish to crates.io
+    needs: [build, checks]
+    runs-on: ubuntu-latest
+    environment: release
+    concurrency:
+      group: touchgate-publish
+      cancel-in-progress: false
+    permissions:
+      contents: read # to check out the release
+      id-token: write # for crates.io trusted publishing
+    steps:
+      - uses: borink-org/touchgate/install@0000000000000000000000000000000000000000 # v0.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+      # Skips what is on crates.io already, so a release that failed halfway
+      # can run again.
+      - run: touchgate publish --locked --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  # Only now does the tag exist, so a tag always names a published release.
+  github-release:
+    name: Tag and release on GitHub
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to create the tag and the release
+    steps:
+      - uses: borink-org/touchgate/install@0000000000000000000000000000000000000000 # v0.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+      - run: touchgate github-release
+        env:
+          GH_TOKEN: ${{ github.token }}

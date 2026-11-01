@@ -13,7 +13,7 @@ inputs:
   commit:
     description: >-
       The touchgate commit to install, when it is not the commit this action
-      is pinned to. touchgate's reusable workflows pass their own.
+      is pinned to, as in touchgate's own repository.
     required: false
     default: ""
   from-source:

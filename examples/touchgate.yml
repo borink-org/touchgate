@@ -1,0 +1,103 @@
+# Everything but the release itself, for `.github/workflows/touchgate.yml` on
+# the default branch. Replace the touchgate commit, that of a release, and
+# `main` if your default branch has another name. Nothing here is trusted:
+# `release.yml` checks the approval on its own.
+#
+# - Started by hand with a version, prepares the release and opens a pull
+#   request for it.
+# - On a push to the default branch and on a pull request, checks the
+#   changelog, and that a pull request that changes what the project releases
+#   says so under `## Unreleased`, unless it is labelled `no-changelog`.
+# - On a push to the default branch that merges an approval, starts
+#   `release.yml` on the `publish` branch.
+name: touchgate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The version to release, such as 0.4.0
+        required: true
+        type: string
+  push:
+    branches: [main]
+  pull_request:
+    # The three default types, and a label change, so that adding no-changelog
+    # runs the changelog check again.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions: {}
+
+jobs:
+  prepare:
+    name: Prepare the release
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    concurrency:
+      group: touchgate-prepare
+      cancel-in-progress: false
+    permissions:
+      contents: write # to push the release branch
+      pull-requests: write # to open the pull request
+    steps:
+      - uses: borink-org/touchgate/install@0000000000000000000000000000000000000000 # v0.1.0
+      # The credentials stay, to push the release branch. They can do no more
+      # than anyone who can start this workflow.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 # zizmor: ignore[artipacked]
+      # For a Python package, preparing a release moves uv.lock along.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: 0.13.6
+          enable-cache: false
+      - name: Prepare the release and open its pull request
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: 'touchgate prepare "$VERSION" --pull-request'
+
+  changelog:
+    name: Check the changelog
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: touchgate-changelog-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read # to check out the history
+    steps:
+      - uses: borink-org/touchgate/install@0000000000000000000000000000000000000000 # v0.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: touchgate check
+      - name: Check for a changelog entry
+        if: >-
+          github.event_name == 'pull_request'
+          && !contains(github.event.pull_request.labels.*.name, 'no-changelog')
+          && !startsWith(github.head_ref, 'release/')
+        env:
+          BASE: origin/${{ github.base_ref }}
+        run: 'touchgate check-entry "$BASE"'
+
+  start:
+    name: Start the release
+    if: >-
+      github.event_name == 'push'
+      && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # to read the merge
+      actions: write # to start release.yml
+    steps:
+      - uses: borink-org/touchgate/install@0000000000000000000000000000000000000000 # v0.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Start the release if this push merges an approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: 'touchgate start --commit "$GITHUB_SHA"'
