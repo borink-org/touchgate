@@ -122,8 +122,10 @@ fn release_commit() -> Result<String, Vec<String>> {
 /// opens a pull request.
 ///
 /// If the changelog dates `version` already and no tag names its release,
-/// changes nothing, and with `--pull-request` opens the pull request again
-/// with an empty commit, for a new approval after a release that failed.
+/// prepares it again after a release that failed: moves any entries of
+/// `## Unreleased` into its section, dated `--date` or today. With
+/// `--pull-request`, the commit on `release/<version>` may then be empty,
+/// for a new approval.
 fn prepare(version: &str, args: &[&str]) -> Result<(), Vec<String>> {
     let version = Version::parse(version).map_err(|error| vec![error])?;
     let (mut date, mut pull_request) = (None, false);
@@ -143,19 +145,33 @@ fn prepare(version: &str, args: &[&str]) -> Result<(), Vec<String>> {
     let project = Project::load()?;
     let path = changelog_path(&project);
     let text = read(&path)?;
+    let write = |text: String| {
+        std::fs::write(&path, text).map_err(|error| vec![format!("{}: {error}", path.display())])
+    };
     let preparation = if current == version {
-        prepared_again(&version, &text)?
+        if github::is_released(&version).map_err(|error| vec![error])? {
+            return Err(vec![format!(
+                "{version} is released already. Prepare a newer version"
+            )]);
+        }
+        if let Some(again) = Changelog::parse(&text)?
+            .release_again(&version, date)
+            .map_err(|error| vec![error])?
+        {
+            write(again)?;
+        }
+        github::Preparation::Again
     } else {
-        let released = Changelog::parse(&text)?
-            .release(&version, date)
-            .map_err(|error| vec![error])?;
-        std::fs::write(&path, released)
-            .map_err(|error| vec![format!("{}: {error}", path.display())])?;
+        write(
+            Changelog::parse(&text)?
+                .release(&version, date)
+                .map_err(|error| vec![error])?,
+        )?;
         project.set_version(&version)?;
-        let checked = check()?;
-        assert_eq!(checked, version);
         github::Preparation::New
     };
+    let checked = check()?;
+    assert_eq!(checked, version);
     println!("{version}");
     if pull_request {
         github::pull_request(
@@ -167,23 +183,6 @@ fn prepare(version: &str, args: &[&str]) -> Result<(), Vec<String>> {
         .map_err(|error| vec![error])?;
     }
     Ok(())
-}
-
-/// Checks that `version`, which the changelog dates already, can be prepared
-/// again: it has not published, and `## Unreleased` has no entries that its
-/// release would leave out.
-fn prepared_again(version: &Version, changelog: &str) -> Result<github::Preparation, Vec<String>> {
-    if github::is_released(version).map_err(|error| vec![error])? {
-        return Err(vec![format!(
-            "{version} is released already. Prepare a newer version"
-        )]);
-    }
-    if !changelog::unreleased_entries(changelog).is_empty() {
-        return Err(vec![format!(
-            "{version} is prepared already, but `## Unreleased` has entries that its release would leave out. Prepare a newer version"
-        )]);
-    }
-    Ok(github::Preparation::Again)
 }
 
 /// Tags the release at `commit`, the checkout, and makes its GitHub release

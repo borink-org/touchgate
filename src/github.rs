@@ -17,7 +17,8 @@ use crate::version::Version;
 pub enum Preparation {
     /// The changelog and the version files change to the new version.
     New,
-    /// Nothing changes, and the branch gets an empty commit, so that a new
+    /// The changelog moves any new entries into the section of the version,
+    /// and the branch gets a commit even if nothing changed, so that a new
     /// approval can go on top of it.
     Again,
 }

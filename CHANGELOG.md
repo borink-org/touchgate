@@ -4,7 +4,7 @@
 
 ### Changed
 
-- `touchgate prepare` opens the release pull request again, with an empty commit, for a version that the changelog dates but no tag names. After a release that failed before it published, run the release steps again with the same version.
+- `touchgate prepare` prepares a version again if the changelog dates it but no tag names it. It moves any entries of `## Unreleased` into that version's section, and opens the release pull request again. After a release that failed before it published, run the release steps again with the same version.
 
 ## 0.1.0 - 2026-11-01
 
