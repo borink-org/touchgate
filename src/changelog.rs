@@ -190,6 +190,70 @@ impl<'a> Changelog<'a> {
         Ok(text)
     }
 
+    /// Returns the text with the entries of `## Unreleased` moved into the
+    /// section of `version`, the newest release, which is dated `date`
+    /// instead. An entry under a `###` heading goes under the same heading
+    /// there. Returns `None` if there is no `## Unreleased`.
+    pub fn release_again(&self, version: &Version, date: Date) -> Result<Option<String>, String> {
+        let Some(unreleased) = self
+            .sections
+            .first()
+            .filter(|section| section.heading == Heading::Unreleased)
+        else {
+            return Ok(None);
+        };
+        let section = self
+            .sections
+            .get(1)
+            .filter(|section| {
+                matches!(&section.heading, Heading::Release { version: v, .. } if v == version)
+            })
+            .ok_or_else(|| format!("CHANGELOG.md: the newest release is not {version}"))?;
+        if let Some(Section {
+            heading:
+                Heading::Release {
+                    version: older,
+                    date: older_date,
+                },
+            ..
+        }) = self.sections.get(2)
+            && date < *older_date
+        {
+            return Err(format!("{date} is before {older}, released {older_date}"));
+        }
+        let mut parts = subsections(&self.lines[section.line + 1..section.end]);
+        for (title, lines) in subsections(&self.lines[unreleased.line + 1..unreleased.end]) {
+            match parts.iter_mut().find(|(existing, _)| *existing == title) {
+                Some((_, existing)) => append_entries(existing, lines),
+                None => parts.push((title, lines)),
+            }
+        }
+        let mut text = String::new();
+        for line in &self.lines[..unreleased.line] {
+            text.push_str(line);
+            text.push('\n');
+        }
+        text.push_str(&format!("## {version} - {date}\n"));
+        for (title, lines) in parts.iter().filter(|(_, lines)| !lines.is_empty()) {
+            if let Some(title) = title {
+                text.push_str(&format!("\n### {title}\n"));
+            }
+            text.push('\n');
+            for line in lines {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+        for line in &self.lines[section.end..] {
+            if text.ends_with("\n") && !text.ends_with("\n\n") && line.starts_with("## ") {
+                text.push('\n');
+            }
+            text.push_str(line);
+            text.push('\n');
+        }
+        Ok(Some(text))
+    }
+
     /// Returns the body of the section of `version`, without its heading, as
     /// the notes of a release.
     pub fn notes(&self, version: &Version) -> Option<String> {
@@ -211,6 +275,51 @@ pub fn unreleased_entries(text: &str) -> Vec<&str> {
         .take_while(|line| !line.starts_with("## "))
         .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
         .collect()
+}
+
+/// Splits the body of a section into the text before its first `###`
+/// heading and the text under each `###` heading, without the blank lines
+/// around each.
+fn subsections<'a>(body: &[&'a str]) -> Vec<(Option<&'a str>, Vec<&'a str>)> {
+    let mut parts = vec![(None, Vec::new())];
+    let mut in_code = false;
+    for line in body {
+        if line.trim_start().starts_with("```") {
+            in_code = !in_code;
+        }
+        match line.strip_prefix("### ").filter(|_| !in_code) {
+            Some(title) => parts.push((Some(title), Vec::new())),
+            None => parts
+                .last_mut()
+                .expect("parts starts non-empty")
+                .1
+                .push(*line),
+        }
+    }
+    for (_, lines) in &mut parts {
+        while lines.last().is_some_and(|line| line.trim().is_empty()) {
+            lines.pop();
+        }
+        let blank = lines
+            .iter()
+            .take_while(|line| line.trim().is_empty())
+            .count();
+        lines.drain(..blank);
+    }
+    parts
+}
+
+/// Appends `more` to the text under one heading. A list continues the list
+/// it follows, and anything else starts a new paragraph.
+fn append_entries<'a>(lines: &mut Vec<&'a str>, more: Vec<&'a str>) {
+    let continues_list = more.first().is_some_and(|line| line.starts_with("- "))
+        && lines
+            .last()
+            .is_some_and(|line| line.starts_with("- ") || line.starts_with(' '));
+    if !lines.is_empty() && !more.is_empty() && !continues_list {
+        lines.push("");
+    }
+    lines.extend(more);
 }
 
 /// Returns whether text comes before the next heading of `level` or above.
@@ -291,5 +400,35 @@ mod tests {
         );
         assert!(unreleased_entries(&released).is_empty());
         assert_eq!(unreleased_entries(VALID), ["- One.", "  - Nested."]);
+    }
+
+    #[test]
+    fn release_again() {
+        let version = Version::parse("0.0.2").unwrap();
+        let date = Date::parse("2026-10-04").unwrap();
+        let text = VALID.replace(
+            "Prose.\n",
+            "### Added\n\n- Three.\n\n### Fixed\n\n- Four.\n",
+        );
+        let again = Changelog::parse(&text)
+            .unwrap()
+            .release_again(&version, date)
+            .unwrap()
+            .unwrap();
+        let changelog = Changelog::parse(&again).unwrap();
+        assert_eq!(changelog.newest_release(), Some((&version, date)));
+        assert_eq!(
+            changelog.notes(&version).unwrap(),
+            "### Added\n\n- Three.\n- One.\n  - Nested.\n\n### Fixed\n\n- Four.\n"
+        );
+        assert!(unreleased_entries(&again).is_empty());
+        let released = Changelog::parse(&again).unwrap();
+        assert_eq!(released.release_again(&version, date).unwrap(), None);
+        assert!(
+            Changelog::parse(VALID)
+                .unwrap()
+                .release_again(&Version::parse("0.0.1").unwrap(), date)
+                .is_err()
+        );
     }
 }

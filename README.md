@@ -12,6 +12,8 @@ touchgate releases a Cargo workspace to crates.io, or a Python package to PyPI, 
 
 When every check on the merge has passed, `release.yml` publishes the release to crates.io or PyPI. It then makes the tag and the GitHub release.
 
+If the release fails, fix the cause on the default branch and copy any change to `release.yml` to `publish`. Then run the same three steps with the same version. touchgate opens the pull request again, and moves anything merged under `## Unreleased` since into that version's section. A version with a tag has published already, and needs a newer version instead. A failure in a step of a release run that has not changed can also be run again from GitHub Actions.
+
 ## Setting up a repository
 
 1. Make a resident key on the security key, where `touchgate approve` looks for it, and install touchgate:

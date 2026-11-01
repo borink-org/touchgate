@@ -120,6 +120,12 @@ fn release_commit() -> Result<String, Vec<String>> {
 /// today, and sets `version` on what the project releases. With
 /// `--pull-request`, also commits that on `release/<version>`, pushes it and
 /// opens a pull request.
+///
+/// If the changelog dates `version` already and no tag names its release,
+/// prepares it again after a release that failed: moves any entries of
+/// `## Unreleased` into its section, dated `--date` or today. With
+/// `--pull-request`, the commit on `release/<version>` may then be empty,
+/// for a new approval.
 fn prepare(version: &str, args: &[&str]) -> Result<(), Vec<String>> {
     let version = Version::parse(version).map_err(|error| vec![error])?;
     let (mut date, mut pull_request) = (None, false);
@@ -135,22 +141,42 @@ fn prepare(version: &str, args: &[&str]) -> Result<(), Vec<String>> {
         }
     }
     let date = date.unwrap_or_else(Date::today);
-    check()?;
+    let current = check()?;
     let project = Project::load()?;
     let path = changelog_path(&project);
     let text = read(&path)?;
-    let released = Changelog::parse(&text)?
-        .release(&version, date)
-        .map_err(|error| vec![error])?;
-    std::fs::write(&path, released)
-        .map_err(|error| vec![format!("{}: {error}", path.display())])?;
-    project.set_version(&version)?;
+    let write = |text: String| {
+        std::fs::write(&path, text).map_err(|error| vec![format!("{}: {error}", path.display())])
+    };
+    let preparation = if current == version {
+        if github::is_released(&version).map_err(|error| vec![error])? {
+            return Err(vec![format!(
+                "{version} is released already. Prepare a newer version"
+            )]);
+        }
+        if let Some(again) = Changelog::parse(&text)?
+            .release_again(&version, date)
+            .map_err(|error| vec![error])?
+        {
+            write(again)?;
+        }
+        github::Preparation::Again
+    } else {
+        write(
+            Changelog::parse(&text)?
+                .release(&version, date)
+                .map_err(|error| vec![error])?,
+        )?;
+        project.set_version(&version)?;
+        github::Preparation::New
+    };
     let checked = check()?;
     assert_eq!(checked, version);
     println!("{version}");
     if pull_request {
         github::pull_request(
             &version,
+            preparation,
             &changelog_in_repository(&project)?,
             project.registry(),
         )
