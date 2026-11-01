@@ -1,24 +1,17 @@
-# The release, as a reusable workflow: checks the approval, publishes to
-# crates.io, then tags the release and makes a GitHub release.
+# touchgate's own release. `touchgate start` starts it when a merge brings in
+# an approval, and the copy on `publish` runs.
 #
-# A repository calls this from its own `.github/workflows/release.yml` on the
-# `publish` branch, pinned to a touchgate commit; the README shows the file.
-# crates.io matches the caller's file, so that is the file its trusted
-# publisher names, with the `release` environment of the publish job here.
-# touchgate is built at the commit this workflow was called at,
-# `job.workflow_sha`.
-
+# It builds static Linux binaries of the release, attests them with GitHub
+# artifact attestations and attaches them to the GitHub release. The install
+# action installs a binary only if its attestation names this file on
+# `publish`. It publishes nothing to crates.io.
 name: release
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
       commit:
         description: The merge commit of the release, on the default branch
-        required: true
-        type: string
-      key:
-        description: The public key that approves a release, as ssh-keygen writes it
         required: true
         type: string
 
@@ -26,66 +19,43 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  TOUCHGATE_KEY: sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIPK8VZox0UVPB1gsQowDPXlOj1Z34IIJ3V4I2chFNYONAAAAC3NzaDpzaWduaW5n release key
+  # The Rust version that builds the binaries.
+  RUST_TOOLCHAIN: 1.99.1
 
 jobs:
-  # Checks the approval without running anything from the commit, because
-  # until this passes the commit is untrusted: a `rust-toolchain.toml`, a
-  # `.cargo/config.toml` or a build script in it could make the check pass.
-  # touchgate is built before the checkout, outside it, with the runner's
-  # toolchain, and reads the commit with git alone.
+  # Checks the approval with touchgate built from this workflow's own commit.
+  # touchgate is built before the checkout and runs nothing from the release.
   verify:
     name: Check the approval
     runs-on: ubuntu-latest
     permissions:
       contents: read # to fetch the default branch
-    outputs:
-      touchgate-sha256: ${{ steps.digest.outputs.sha256 }}
     steps:
       - name: Build touchgate
         working-directory: ${{ runner.temp }}
-        env:
-          TOUCHGATE_REV: ${{ job.workflow_sha }}
         run: >-
           cargo install --locked --root "$RUNNER_TEMP/touchgate"
-          --git https://github.com/borink-org/touchgate --rev "$TOUCHGATE_REV" touchgate
+          --git https://github.com/borink-org/touchgate --rev "$GITHUB_WORKFLOW_SHA" touchgate
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
           persist-credentials: false
-          path: repository
-      - name: Check the approval
-        working-directory: ${{ runner.temp }}
-        env:
-          COMMIT: ${{ inputs.commit }}
-          KEY: ${{ inputs.key }}
-          BRANCH: origin/${{ github.event.repository.default_branch }}
-          # The commit of the caller's workflow: publish as this run uses it.
-          WORKFLOW_COMMIT: ${{ github.workflow_sha }}
-        run: >-
-          "$RUNNER_TEMP/touchgate/bin/touchgate" verify --repo "$GITHUB_WORKSPACE/repository"
-          --commit "$COMMIT" --branch "$BRANCH" --key "$KEY" --workflow-commit "$WORKFLOW_COMMIT"
-      # Later jobs run this binary only if it still has this digest. A job's
-      # outputs cannot change once it ends, but a step in a later job can
-      # replace the artifact, and the build job runs every dependency's build
-      # scripts. The binary cannot vouch for itself, so sha256sum does this.
-      - name: Record the digest of touchgate
-        id: digest
-        run: echo "sha256=$(sha256sum < "$RUNNER_TEMP/touchgate/bin/touchgate" | cut -c1-64)" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: touchgate
-          path: ${{ runner.temp }}/touchgate/bin/touchgate
-          retention-days: 1
+      - run: '"$RUNNER_TEMP/touchgate/bin/touchgate" verify'
 
-  # The commit is approved from here on, so building it is safe. The build
-  # runs here, apart from the job that can get a crates.io token: every step
-  # of a job allowed `id-token: write` can ask for that token, and building
-  # runs the build scripts and procedural macros of every dependency.
+  # The commit is approved from here on, so building it is safe.
   build:
-    name: Build the release
+    name: Build for ${{ matrix.target }}
     needs: verify
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read # to check out the release
     steps:
@@ -93,86 +63,67 @@ jobs:
         with:
           ref: ${{ inputs.commit }}
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: touchgate
-          path: ${{ runner.temp }}/touchgate
-      - name: Check the digest of touchgate
+      - name: Install Rust
         env:
-          SHA256: ${{ needs.verify.outputs.touchgate-sha256 }}
+          TARGET: ${{ matrix.target }}
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
         run: >-
-          echo "$SHA256  $RUNNER_TEMP/touchgate/touchgate" | sha256sum --check --strict
-          && chmod +x "$RUNNER_TEMP/touchgate/touchgate"
-      - run: '"$RUNNER_TEMP/touchgate/touchgate" check'
-      - run: cargo publish --workspace --locked --dry-run
+          cargo "+$RUST_TOOLCHAIN" build --release --locked --target "$TARGET"
+          && mkdir dist && cp "target/$TARGET/release/touchgate" "dist/touchgate-$TARGET"
+      - name: Check the version against the changelog
+        env:
+          TARGET: ${{ matrix.target }}
+        run: '"dist/touchgate-$TARGET" check'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: touchgate-${{ matrix.target }}
+          path: dist
+          retention-days: 7
 
-  # Publishes only once every check on the merge commit has passed: the
-  # repository's own CI on the default branch, after the merge.
   checks:
     name: Wait for the merge's checks
-    needs: verify
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       checks: read # to read the merge commit's check runs
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: touchgate
-          path: ${{ runner.temp }}/touchgate
-      - name: Check the digest of touchgate
+          name: touchgate-x86_64-unknown-linux-musl
+          path: dist
+      - run: chmod +x dist/touchgate-x86_64-unknown-linux-musl
+      - run: dist/touchgate-x86_64-unknown-linux-musl wait-for-checks
         env:
-          SHA256: ${{ needs.verify.outputs.touchgate-sha256 }}
-        run: >-
-          echo "$SHA256  $RUNNER_TEMP/touchgate/touchgate" | sha256sum --check --strict
-          && chmod +x "$RUNNER_TEMP/touchgate/touchgate"
-      - name: Wait for every check on the merge to pass
-        env:
-          COMMIT: ${{ inputs.commit }}
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: '"$RUNNER_TEMP/touchgate/touchgate" wait-for-checks --commit "$COMMIT"'
 
-  # Compiles nothing: `--no-verify` packages and uploads what the build job
-  # built, and `cargo metadata` runs no build script.
-  publish:
-    name: Publish to crates.io
-    needs: [verify, build, checks]
+  # Runs nothing from the release. It signs that this workflow, on
+  # `publish`, built these files. The build jobs run the build scripts of
+  # every dependency, so they cannot get the token that signing needs.
+  attest:
+    name: Attest the binaries
+    needs: [build, checks]
     runs-on: ubuntu-latest
     environment: release
-    concurrency:
-      group: touchgate-publish
-      cancel-in-progress: false
     permissions:
-      contents: read # to check out the release
-      id-token: write # for crates.io trusted publishing
+      id-token: write # to sign with this workflow's identity
+      attestations: write # to store the attestations
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          ref: ${{ inputs.commit }}
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+          pattern: touchgate-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          name: touchgate
-          path: ${{ runner.temp }}/touchgate
-      - name: Check the digest of touchgate
-        env:
-          SHA256: ${{ needs.verify.outputs.touchgate-sha256 }}
-        run: >-
-          echo "$SHA256  $RUNNER_TEMP/touchgate/touchgate" | sha256sum --check --strict
-          && chmod +x "$RUNNER_TEMP/touchgate/touchgate"
-      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-        id: auth
-      # Skips what is on crates.io already, so a release that failed halfway
-      # can run again.
-      - name: Publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: '"$RUNNER_TEMP/touchgate/touchgate" publish --locked --no-verify'
+          subject-path: dist/touchgate-*
 
-  # Only now does the tag exist, so a tag always names a published release.
+  # This job runs last, so a tag always names an attested release.
   github-release:
     name: Tag and release on GitHub
-    needs: [verify, publish]
+    needs: attest
     runs-on: ubuntu-latest
     permissions:
       contents: write # to create the tag and the release
@@ -181,18 +132,12 @@ jobs:
         with:
           ref: ${{ inputs.commit }}
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: touchgate
-          path: ${{ runner.temp }}/touchgate
-      - name: Check the digest of touchgate
+          pattern: touchgate-*
+          path: dist
+          merge-multiple: true
+      - run: chmod +x dist/touchgate-x86_64-unknown-linux-musl
+      - run: dist/touchgate-x86_64-unknown-linux-musl github-release dist/touchgate-*
         env:
-          SHA256: ${{ needs.verify.outputs.touchgate-sha256 }}
-        run: >-
-          echo "$SHA256  $RUNNER_TEMP/touchgate/touchgate" | sha256sum --check --strict
-          && chmod +x "$RUNNER_TEMP/touchgate/touchgate"
-      - name: Tag the release and make a GitHub release
-        env:
-          COMMIT: ${{ inputs.commit }}
           GH_TOKEN: ${{ github.token }}
-        run: '"$RUNNER_TEMP/touchgate/touchgate" github-release --commit "$COMMIT"'

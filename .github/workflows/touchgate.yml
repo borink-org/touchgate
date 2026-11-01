@@ -1,32 +1,23 @@
-# Everything but the release itself, as a reusable workflow. Nothing here is
-# trusted: `release.yml` checks the approval on its own.
-#
-# - Started by hand with a version, prepares the release and opens a pull
-#   request for it.
-# - On a push to the default branch and on a pull request, checks the
-#   changelog, and that a pull request that changes a published package says
-#   so under `## Unreleased`, unless it is labelled `no-changelog`.
-# - On a push to the default branch that merges an approval, starts
-#   `release.yml` on the `publish` branch.
-#
-# A repository calls this from `.github/workflows/touchgate.yml`; the README
-# shows the file. touchgate is built at the commit this workflow was called
-# at, `job.workflow_sha`.
-
+# touchgate's own copy of examples/touchgate.yml. Each install step builds
+# touchgate from source at the commit that the workflow runs on, because that
+# commit is not a release. CI fails if the two files differ in anything else.
 name: touchgate
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
       version:
-        description: The version to prepare, when started by hand
-        required: false
+        description: The version to release, such as 0.4.0
+        required: true
         type: string
+  push:
+    branches: [main]
+  pull_request:
+    # The three default types and the label changes. Adding no-changelog then
+    # runs the changelog check again.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions: {}
-
-env:
-  CARGO_TERM_COLOR: always
 
 jobs:
   prepare:
@@ -42,17 +33,13 @@ jobs:
       contents: write # to push the release branch
       pull-requests: write # to open the pull request
     steps:
+      - uses: $/install
+        with:
+          from-source: true
       # The credentials stay, to push the release branch. They can do no more
       # than anyone who can start this workflow.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 # zizmor: ignore[artipacked]
-      - name: Build touchgate
-        working-directory: ${{ runner.temp }}
-        env:
-          TOUCHGATE_REV: ${{ job.workflow_sha }}
-        run: >-
-          cargo install --locked --root "$RUNNER_TEMP/touchgate"
-          --git https://github.com/borink-org/touchgate --rev "$TOUCHGATE_REV" touchgate
-      # For a Python package, preparing a release moves uv.lock along.
+      # For a Python package, `touchgate prepare` updates uv.lock.
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: 0.13.6
@@ -61,7 +48,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           GH_TOKEN: ${{ github.token }}
-        run: '"$RUNNER_TEMP/touchgate/bin/touchgate" prepare "$VERSION" --pull-request'
+        run: 'touchgate prepare "$VERSION" --pull-request'
 
   changelog:
     name: Check the changelog
@@ -73,18 +60,14 @@ jobs:
     permissions:
       contents: read # to check out the history
     steps:
+      - uses: $/install
+        with:
+          from-source: true
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Build touchgate
-        working-directory: ${{ runner.temp }}
-        env:
-          TOUCHGATE_REV: ${{ job.workflow_sha }}
-        run: >-
-          cargo install --locked --root "$RUNNER_TEMP/touchgate"
-          --git https://github.com/borink-org/touchgate --rev "$TOUCHGATE_REV" touchgate
-      - run: '"$RUNNER_TEMP/touchgate/bin/touchgate" check'
+      - run: touchgate check
       - name: Check for a changelog entry
         if: >-
           github.event_name == 'pull_request'
@@ -92,7 +75,7 @@ jobs:
           && !startsWith(github.head_ref, 'release/')
         env:
           BASE: origin/${{ github.base_ref }}
-        run: '"$RUNNER_TEMP/touchgate/bin/touchgate" check-entry "$BASE"'
+        run: 'touchgate check-entry "$BASE"'
 
   start:
     name: Start the release
@@ -104,18 +87,14 @@ jobs:
       contents: read # to read the merge
       actions: write # to start release.yml
     steps:
+      - uses: $/install
+        with:
+          from-source: true
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
           persist-credentials: false
-      - name: Build touchgate
-        working-directory: ${{ runner.temp }}
-        env:
-          TOUCHGATE_REV: ${{ job.workflow_sha }}
-        run: >-
-          cargo install --locked --root "$RUNNER_TEMP/touchgate"
-          --git https://github.com/borink-org/touchgate --rev "$TOUCHGATE_REV" touchgate
       - name: Start the release if this push merges an approval
         env:
           GH_TOKEN: ${{ github.token }}
-        run: '"$RUNNER_TEMP/touchgate/bin/touchgate" start --commit "$GITHUB_SHA"'
+        run: 'touchgate start --commit "$GITHUB_SHA"'

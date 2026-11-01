@@ -1,0 +1,31 @@
+name: Install touchgate
+description: >-
+  Downloads the binary of the touchgate release this action is pinned to,
+  checks with gh attestation verify that touchgate's release workflow built
+  it, and puts it on the PATH.
+
+# Pin this action to the full commit that a release tag names:
+#
+#   - uses: borink-org/touchgate/install@<commit> # v0.1.0
+
+inputs:
+  from-source:
+    description: >-
+      Build touchgate with cargo from the commit this action is pinned to,
+      instead of downloading a release. touchgate's own repository builds
+      every commit this way.
+    required: false
+    default: "false"
+  token:
+    description: The token that gh reads the release and its attestation with.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        FROM_SOURCE: ${{ inputs.from-source }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: '"$GITHUB_ACTION_PATH/install.sh"'

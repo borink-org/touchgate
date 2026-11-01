@@ -64,13 +64,13 @@ impl Version {
 }
 
 impl Version {
-    /// Whether this is a pre-release, such as `1.0.0-rc.1`.
+    /// Returns whether this is a pre-release, such as `1.0.0-rc.1`.
     pub fn is_pre_release(&self) -> bool {
         !self.pre.is_empty()
     }
 }
 
-/// A decimal number without leading zeros.
+/// Parses a decimal number without leading zeros.
 fn number(text: &str) -> Option<u64> {
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -149,7 +149,7 @@ impl Date {
         })
     }
 
-    /// Today in UTC.
+    /// Returns today's date in UTC.
     pub fn today() -> Self {
         let seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)

@@ -41,12 +41,13 @@ pub struct Changelog<'a> {
 impl<'a> Changelog<'a> {
     /// Checks the shape of the changelog.
     ///
-    /// The changelog opens with `# Changelog`. Each section is headed
-    /// `## Unreleased`, which may only come first, or `## X.Y.Z - YYYY-MM-DD`,
-    /// with versions falling and dates not rising down the file. A section may
-    /// divide its entries under the `###` headings of Keep a Changelog. No
-    /// heading is empty. Each paragraph and list item is one line, so a line of
-    /// text that is not a list item follows a blank line or a heading.
+    /// The changelog opens with `# Changelog`. Each section has the heading
+    /// `## Unreleased` or `## X.Y.Z - YYYY-MM-DD`, and `## Unreleased` may
+    /// only come first. Down the file, versions fall and dates do not rise. A
+    /// section may divide its entries under the `###` headings of Keep a
+    /// Changelog. No heading is empty. Each paragraph and list item is one
+    /// line. A line of text that is not a list item therefore follows a blank
+    /// line or a heading.
     pub fn parse(text: &'a str) -> Result<Self, Vec<String>> {
         let lines: Vec<&str> = text.lines().collect();
         let mut errors = Vec::new();
@@ -150,7 +151,7 @@ impl<'a> Changelog<'a> {
         }
     }
 
-    /// The newest released version.
+    /// Returns the newest released version.
     pub fn newest_release(&self) -> Option<(&Version, Date)> {
         self.sections
             .iter()
@@ -160,7 +161,8 @@ impl<'a> Changelog<'a> {
             })
     }
 
-    /// The text with `## Unreleased` turned into the section of `version`.
+    /// Returns the text with `## Unreleased` turned into the section of
+    /// `version`.
     pub fn release(&self, version: &Version, date: Date) -> Result<String, String> {
         let unreleased = self
             .sections
@@ -188,8 +190,8 @@ impl<'a> Changelog<'a> {
         Ok(text)
     }
 
-    /// The body of the section of `version`, without its heading, for the
-    /// notes of a release.
+    /// Returns the body of the section of `version`, without its heading, as
+    /// the notes of a release.
     pub fn notes(&self, version: &Version) -> Option<String> {
         let section = self.sections.iter().find(|section| {
             matches!(&section.heading, Heading::Release { version: v, .. } if v == version)
@@ -199,9 +201,9 @@ impl<'a> Changelog<'a> {
     }
 }
 
-/// The non-blank lines under `## Unreleased`, without subsection headings.
-/// This reads any text, since the base of a pull request may predate the rules
-/// that [`Changelog::parse`] enforces.
+/// Returns the non-blank lines under `## Unreleased`, without subsection
+/// headings. This reads any text, since the base of a pull request may predate
+/// the rules that [`Changelog::parse`] enforces.
 pub fn unreleased_entries(text: &str) -> Vec<&str> {
     text.lines()
         .skip_while(|line| *line != "## Unreleased")
@@ -211,7 +213,7 @@ pub fn unreleased_entries(text: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Whether text comes before the next heading of `level` or above.
+/// Returns whether text comes before the next heading of `level` or above.
 fn has_content(rest: &[&str], level: usize) -> bool {
     for line in rest {
         let hashes = line.len() - line.trim_start_matches('#').len();

@@ -22,7 +22,7 @@ pub enum Registry {
 }
 
 impl Registry {
-    /// The registry's name, as a sentence names it.
+    /// Returns the name of the registry, as a sentence writes it.
     pub fn name(self) -> &'static str {
         match self {
             Self::CratesIo => "crates.io",
@@ -61,8 +61,9 @@ impl ReleaseKind {
         }
     }
 
-    /// A `pyproject.toml` without `[project]` only configures tools, as in a
-    /// Rust repository, and makes no Python release.
+    /// Reads the kind of release from the text of a `pyproject.toml`. A
+    /// `pyproject.toml` without `[project]` only configures tools, as in a Rust
+    /// repository, and makes no Python release.
     fn from_pyproject(text: &str) -> Result<Self, String> {
         let document: DocumentMut = text.parse().map_err(|error| format!("{error}"))?;
         if document
@@ -120,8 +121,8 @@ impl Project {
         }
     }
 
-    /// The directory of the changelog: the root of the Cargo workspace, or
-    /// the directory of `pyproject.toml`.
+    /// Returns the directory of the changelog: the root of the Cargo workspace,
+    /// or the directory of `pyproject.toml`.
     pub fn root(&self) -> &Path {
         match self {
             Self::Crates(workspace) => &workspace.root,
@@ -129,8 +130,8 @@ impl Project {
         }
     }
 
-    /// The version the project is at. A Python package's Rust extension must
-    /// be at the same version.
+    /// Returns the version that the project is at. The Rust extension of a
+    /// Python package must be at the same version.
     pub fn version(&self) -> Result<Version, Vec<String>> {
         match self {
             Self::Crates(workspace) => workspace.version().cloned(),
@@ -170,9 +171,9 @@ impl Project {
         }
     }
 
-    /// The names of what is released, with the directory each covers: a
-    /// change under one needs a changelog entry. A Python package covers its
-    /// whole directory.
+    /// Returns the names of what is released, each with the directory it
+    /// covers. A change under one of these directories needs a changelog entry.
+    /// A Python package covers its whole directory.
     pub fn released_dirs(&self) -> Vec<(&str, &Path)> {
         match self {
             Self::Crates(workspace) => workspace
@@ -184,7 +185,7 @@ impl Project {
     }
 }
 
-/// The top directory of the git repository the current directory is in.
+/// Returns the top directory of the git repository the current directory is in.
 fn repository_root() -> Result<PathBuf, Vec<String>> {
     let top = crate::run(Command::new("git").args(["rev-parse", "--show-toplevel"]))?;
     Ok(PathBuf::from(top.trim_end()))

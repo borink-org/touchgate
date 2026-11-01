@@ -2,36 +2,40 @@
 //! and PIN.
 //!
 //! A release is a merge commit on the release branch. Its second parent is the
-//! approval: a commit whose subject starts with `Approve release`, signed with
-//! a FIDO2 SSH key (`sk-ssh-ed25519` or `sk-ecdsa-sha2-nistp256`), and with the
-//! same tree as the merge. So the signature covers exactly what is released.
+//! approval, which must meet three conditions:
+//!
+//! - Its subject starts with `Approve release`.
+//! - It is signed with a FIDO2 SSH key, `sk-ssh-ed25519` or
+//!   `sk-ecdsa-sha2-nistp256`.
+//! - It has the same tree as the merge, so the signature covers exactly what
+//!   is released.
 //!
 //! `ssh-keygen -Y verify` checks the signature against the one key allowed.
-//! It does not check how the signature was made: the allowed-signers format
-//! has no option that demands a touch or a PIN, and a FIDO2 key asked for a
-//! silent assertion signs without either. The authenticator signs a flags
-//! byte along with the message, so this module reads that byte and requires
-//! user presence and user verification.
+//! It does not check how the key made the signature. The allowed-signers
+//! format has no option that demands a touch or a PIN, and a FIDO2 key asked
+//! for a silent assertion signs without either. The authenticator signs a
+//! flags byte along with the message. This module reads that byte and
+//! requires user presence and user verification.
 //!
-//! Nothing here runs code from the commits it checks, because until the
-//! check passes the tree is untrusted, and anything that builds it, or runs
-//! `cargo` inside it, could fake a pass. Commits are read as raw objects with
-//! `git cat-file`, and parsed here, rather than through commands whose output
-//! configuration can change. Replacement objects are off, since a
-//! `refs/replace/` ref would make git answer for one commit with another, and
-//! so are the user's and the system's git configuration.
+//! Nothing here runs code from the commits it checks. Until the check passes,
+//! the tree is untrusted, and anything that builds it or runs `cargo` inside
+//! it could fake a pass. This module reads commits as raw objects with
+//! `git cat-file` and parses them itself. Configuration cannot change that
+//! output. Replacement objects are off, because a `refs/replace/` ref would
+//! make git answer for one commit with another. The user's and the system's
+//! git configuration are off too.
 //!
-//! The approval also names, in a `Release-Workflow` trailer, the commit of
-//! the `publish` branch it expects the release to run from. A change to that
-//! branch after the approval then stops the release until it is approved
-//! again. This catches a change made in good faith that the approver did not
-//! know of. It cannot stop a change made to get around it, since such a change
-//! can remove this check too; only the ruleset on `publish` does that.
+//! The approval also names the commit of the `publish` branch that it expects
+//! the release to run from, in a `Release-Workflow` trailer. A change to that
+//! branch after the approval stops the release until someone approves again.
+//! This catches a change made in good faith that the approver did not know
+//! of. A change made to get around the check can remove the check as well.
+//! Only the ruleset on `publish` stops such a change.
 //!
 //! An approval expires: its committer time, which the signature covers, must
-//! be recent. Otherwise an approval of a tree that was later abandoned, say
-//! for a bug found after approving, could be merged and released by anyone
-//! who can push.
+//! be recent. Without this, anyone who can push could merge and release an
+//! approved tree that was later abandoned, for example for a bug found after
+//! approving.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -222,8 +226,8 @@ pub fn parse_age(text: &str) -> Result<i64, String> {
     }
 }
 
-/// A number of seconds in the unit that reads best: minutes under two hours,
-/// hours under two days, days beyond.
+/// Formats a number of seconds in minutes under two hours, in hours under two
+/// days, and in days beyond.
 fn describe(seconds: i64) -> String {
     match seconds {
         ..7_200 => format!("{} minutes", seconds / 60),
@@ -232,9 +236,9 @@ fn describe(seconds: i64) -> String {
     }
 }
 
-/// The approval that the merge `commit` brings in, if its second parent's
-/// subject names one. Checks nothing else: this only decides whether a
-/// release is worth starting, and [`verify`] decides whether it publishes.
+/// Returns the approval that the merge `commit` brings in, if the subject of
+/// its second parent names one. Checks nothing else. This function only decides
+/// whether to start a release, and [`verify`] decides whether it publishes.
 pub fn merged_approval(repo: &Path, commit: &str) -> Result<Option<String>, String> {
     if !is_hash(commit) {
         return Err(format!("`{commit}` is not a full commit hash"));
@@ -250,7 +254,7 @@ pub fn merged_approval(repo: &Path, commit: &str) -> Result<Option<String>, Stri
         .then(|| approval.clone()))
 }
 
-/// Whether `text` is a full SHA-1 or SHA-256 commit hash.
+/// Returns whether `text` is a full SHA-1 or SHA-256 commit hash.
 pub fn is_hash(text: &str) -> bool {
     (text.len() == 40 || text.len() == 64)
         && text
@@ -258,7 +262,8 @@ pub fn is_hash(text: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// git, with what could make it answer for another object turned off.
+/// Returns a git command, with the settings that could make git answer for
+/// another object turned off.
 fn git(repo: &Path) -> Command {
     let mut command = Command::new("git");
     command
@@ -396,12 +401,13 @@ fn ssh_keygen_verify(
 /// Commits an empty, signed approval with `message` on top of `head`, the tip
 /// of `branch`, and moves the branch to it.
 ///
-/// This signs with `ssh-keygen -Y sign` itself rather than through
-/// `git commit -S`, because git keeps ssh-keygen's error output to itself, and
-/// that is where ssh-keygen asks to confirm user presence after the PIN. It
-/// signs without an SSH agent: an agent that holds the key would be asked
-/// instead, and one such as GNOME Keyring's cannot ask a security key for its
-/// PIN, so it refuses.
+/// This function runs `ssh-keygen -Y sign` itself instead of `git commit -S`.
+/// git hides the error output of ssh-keygen, and ssh-keygen asks there for a
+/// touch after the PIN.
+///
+/// It also signs without an SSH agent. ssh-keygen would ask an agent that
+/// holds the key instead. An agent such as GNOME Keyring's cannot ask a
+/// security key for its PIN, so it refuses.
 pub fn sign_approval(
     key: &Path,
     branch: &str,
@@ -503,8 +509,8 @@ pub fn sign_approval(
     Ok(approval)
 }
 
-/// A directory no one else made: creating it fails if the name is taken, so
-/// nothing placed there beforehand is read as the allowed signers.
+/// Creates a directory that no one else made. Creating it fails if the name is
+/// taken, so nothing placed there beforehand is read as the allowed signers.
 fn fresh_dir() -> Result<PathBuf, String> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -547,7 +553,7 @@ fn split_signature(raw: &[u8], header: &str) -> Option<(Vec<u8>, String)> {
     Some((payload, armored?.trim_end().to_owned()))
 }
 
-/// The bytes inside `-----BEGIN SSH SIGNATURE-----`.
+/// Returns the bytes inside `-----BEGIN SSH SIGNATURE-----`.
 fn decode_armor(armored: &str) -> Result<Vec<u8>, String> {
     let body: String = armored
         .lines()
@@ -562,7 +568,7 @@ fn decode_armor(armored: &str) -> Result<Vec<u8>, String> {
     base64(&body).ok_or_else(|| "the SSH signature is not valid base64".to_owned())
 }
 
-/// The type and the decoded blob of a public key line.
+/// Returns the type and the decoded blob of a public key line.
 fn parse_public_key(key: &str) -> Result<(&str, Vec<u8>), String> {
     let mut fields = key.split_whitespace();
     let (Some(key_type), Some(blob)) = (fields.next(), fields.next()) else {

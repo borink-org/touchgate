@@ -1,6 +1,6 @@
 //! Prepares the release of a Cargo workspace or a Python package from a
-//! hand-written changelog, and lets CI publish it only after a person approved
-//! it with a hardware key, by touch and PIN.
+//! hand-written changelog. CI publishes the release only after a person
+//! approves it with a hardware key, by touch and PIN.
 //!
 //! See the README for the release process these commands make up.
 
@@ -21,9 +21,8 @@ use project::Project;
 use version::{Date, Version};
 use workspace::Workspace;
 
-/// How long an approval lasts unless `--max-age` says otherwise: long enough
-/// to merge once the pull request's checks pass, and short enough that an
-/// approval left unmerged is soon worthless.
+/// How long an approval lasts, unless `--max-age` gives another time. An
+/// hour is enough to merge after the checks of the pull request pass.
 const DEFAULT_MAX_AGE: &str = "1h";
 
 const USAGE: &str = "\
@@ -77,9 +76,11 @@ fn main() -> ExitCode {
     }
 }
 
-/// Checks that the changelog has the shape [`Changelog::parse`] describes,
-/// that what the project releases is at one version, and that the newest
-/// released section of the changelog is that version. Returns the version.
+/// Checks the version against the changelog, and returns the version.
+///
+/// The changelog must have the shape that [`Changelog::parse`] describes.
+/// Everything the project releases must be at one version, and the newest
+/// released section of the changelog must be that version.
 fn check() -> Result<Version, Vec<String>> {
     let project = Project::load()?;
     let version = project.version()?;
@@ -108,7 +109,7 @@ fn check_build() -> Result<(), Vec<String>> {
     Ok(())
 }
 
-/// The merge commit the release run was started with.
+/// Returns the merge commit the release run was started with.
 fn release_commit() -> Result<String, Vec<String>> {
     actions::ReleaseRun::load()
         .map(|run| run.commit)
@@ -505,7 +506,8 @@ fn publish_crates(workspace: &Workspace, cargo_args: &[&str]) -> Result<(), Vec<
     }
 }
 
-/// The changelog's path in the git repository, which a link on GitHub names.
+/// Returns the path of the changelog in the git repository, which a link on
+/// GitHub names.
 fn changelog_in_repository(project: &Project) -> Result<String, Vec<String>> {
     let top =
         PathBuf::from(run(Command::new("git").args(["rev-parse", "--show-toplevel"]))?.trim_end());
@@ -517,7 +519,7 @@ fn changelog_in_repository(project: &Project) -> Result<String, Vec<String>> {
         .ok_or_else(|| vec![format!("{} is not a UTF-8 path", relative.display())])
 }
 
-/// The changelog, at the root of the project.
+/// Returns the path of the changelog, at the root of the project.
 fn changelog_path(project: &Project) -> PathBuf {
     project.root().join("CHANGELOG.md")
 }
@@ -541,7 +543,7 @@ fn run(command: &mut Command) -> Result<String, Vec<String>> {
     }
 }
 
-/// The output of the program `name`, which must be UTF-8.
+/// Returns the output of the program `name`, which must be UTF-8.
 fn utf8(bytes: Vec<u8>, name: &str) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| format!("{name} wrote output that is not UTF-8"))
 }

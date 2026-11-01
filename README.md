@@ -2,100 +2,82 @@
 
 **EXPERIMENTAL: Still playing around, do not depend on its security!**
 
-Releases a Cargo workspace to crates.io, or a Python package to PyPI, from a hand-written `CHANGELOG.md`, and lets CI publish only after you approve with a FIDO2 security key, by touch and PIN. Nothing holding your GitHub token, such as a coding agent, can publish on its own.
+touchgate releases a Cargo workspace to crates.io, or a Python package to PyPI, from a hand-written `CHANGELOG.md`. CI publishes a release only after you approve it with a FIDO2 security key, by touch and PIN. Anything that holds your GitHub token, such as a coding agent, cannot publish on its own.
 
-## Release
+## Releasing
 
-1. Run the `prepare-release` workflow with a version. It dates `## Unreleased`, sets the version and opens a pull request.
-2. Once its checks pass, check out the branch and run `touchgate approve`. It signs an empty `Approve release 0.4.0.` commit with the key, which asks for its PIN and a touch, and pushes it. Your git signing settings stay as they are.
-3. Within the hour, merge with a merge commit. Once every check on the merge has passed, the release publishes to crates.io or PyPI, then tags and makes the GitHub release.
+1. Run the `touchgate` workflow with a version. It dates `## Unreleased`, sets the version and opens a pull request.
+2. When the checks of the pull request pass, check out its branch and run `touchgate approve`. The key asks for its PIN and a touch. touchgate then signs an empty commit `Approve release 0.4.0.` and pushes it. Your git signing settings do not change.
+3. Merge the pull request with a merge commit within the hour.
 
-## What it checks
+When every check on the merge has passed, `release.yml` publishes the release to crates.io or PyPI. It then makes the tag and the GitHub release.
 
-The merge's second parent must be the approval: same tree as the merge, at most an hour old, signed by the one key in `release.yml`, with the signature's flags showing a touch and the PIN, and naming the `publish` commit the release runs from, so a change to `publish` after you approve stops the release. git and `ssh-keygen` accept FIDO2 signatures made without either, so touchgate reads those flags itself. It runs no code from the commit it checks.
+## Setting up a repository
 
-## What it relies on
+1. Make a resident key on the security key, where `touchgate approve` looks for it, and install touchgate:
 
-- Your everyday account has Maintain, never Admin, on the repository and on touchgate. A separate admin account, used only in the browser, makes the settings below.
-- `release.yml` runs from a `publish` branch that a ruleset lets only the admin change, in a `release` environment limited to exactly that branch.
-- crates.io or PyPI trusts only `release.yml` in the `release` environment, with Trusted Publishing only and no API tokens left.
-- Immutable releases are on.
+   ```nu
+   ssh-keygen -t ed25519-sk -O resident -O verify-required -O application=ssh:signing -f ~/.ssh/id_ed25519_sk_signing
+   cargo install --locked --git https://github.com/borink-org/touchgate
+   ```
 
-## Set up
+2. Copy [`examples/touchgate.yml`](examples/touchgate.yml) to `.github/workflows/touchgate.yml` on your default branch. It prepares releases, checks the changelog, and starts `release.yml` when a merge brings in an approval.
+3. Copy [`examples/crates-release.yml`](examples/crates-release.yml) to `.github/workflows/release.yml`. For a Python package, copy [`examples/pypi-release.yml`](examples/pypi-release.yml) instead. Set `TOUCHGATE_KEY` in it to the contents of your `.pub` file.
+4. In both files, replace the commit in `borink-org/touchgate/install@<commit>` with the commit of a touchgate release. The release's tag on GitHub names that commit.
+5. Commit both files to the default branch, and copy `release.yml` to a `publish` branch.
+6. With the admin account, make the settings in [Settings](#settings).
 
-Make a resident key on the security key, where `touchgate approve` looks for it, and install touchgate:
+Both workflow files are yours to change. Each step that does more than check out, build or upload runs a touchgate command. To update touchgate, change the commit in the install steps, and bring over any other change to the examples.
 
-```nu
-ssh-keygen -t ed25519-sk -O resident -O verify-required -O application=ssh:signing -f ~/.ssh/id_ed25519_sk_signing
-cargo install --locked --git https://github.com/borink-org/touchgate
-```
+## Settings
 
-Add two workflows that call touchgate's, pinned to a touchgate commit. `.github/workflows/touchgate.yml`, with your default branch:
+Your everyday account has Maintain on the repository, not Admin. A separate admin account, which signs in only in the browser, makes these settings:
 
-```yaml
-name: touchgate
-on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: The version to release, such as 0.4.0
-        required: true
-        type: string
-  push:
-    branches: [main]
-  pull_request:
-    # The three default types, and a label change, so that adding no-changelog
-    # runs the changelog check again.
-    types: [opened, synchronize, reopened, labeled, unlabeled]
-permissions: {}
-jobs:
-  touchgate:
-    uses: borink-org/touchgate/.github/workflows/touchgate.yml@<commit>
-    permissions:
-      contents: write
-      pull-requests: write
-      actions: write
-    with:
-      version: ${{ inputs.version }}
-```
+- A ruleset that lets only the admin create, update or delete the `publish` branch, and that blocks force pushes.
+- A `release` environment that admits only the `publish` branch.
+- A trusted publisher on crates.io or PyPI for `release.yml` in the `release` environment. Delete every API token for the package.
+- Immutable releases.
+- GitHub Actions allowed to create pull requests.
+- A `no-changelog` label, for pull requests that need no changelog entry.
 
-`.github/workflows/release.yml`, with the contents of your `.pub` file, committed to both the default branch and `publish`:
+## What the release checks
 
-```yaml
-name: release
-on:
-  workflow_dispatch:
-    inputs:
-      commit:
-        required: true
-        type: string
-permissions: {}
-jobs:
-  release:
-    uses: borink-org/touchgate/.github/workflows/release.yml@<commit>
-    permissions:
-      contents: write
-      id-token: write
-      checks: read
-    with:
-      commit: ${{ inputs.commit }}
-      key: sk-ssh-ed25519@openssh.com AAAA...
-```
+`touchgate verify` checks the merge commit before anything else runs. The second parent of the merge must be the approval, and the approval must meet these conditions:
 
-Allow GitHub Actions to create pull requests, and add a `no-changelog` label for pull requests with nothing to say in the changelog.
+- It has the same tree as the merge.
+- It is at most an hour old.
+- It is signed by the key in `TOUCHGATE_KEY`, with flags that show a touch and the PIN. git and `ssh-keygen` accept a FIDO2 signature without these flags, so touchgate reads the flags itself.
+- It names the commit of `publish` that the release runs from. A change to `publish` after you approve stops the release.
+
+touchgate runs no code from the commit that it checks.
+
+## Installing touchgate in a workflow
+
+Each job installs touchgate with `borink-org/touchgate/install`, pinned to the commit of a release. The action downloads the static Linux binary of that release. It then runs `gh attestation verify`, which checks that touchgate's own `release.yml` built the binary on touchgate's `publish` branch. The action fails for a commit that is not a release, unless you set `from-source: true` to build that commit with cargo.
 
 ## A Python package on PyPI
 
-touchgate releases to PyPI when the repository has a `pyproject.toml` at its root with a `[project]` table, and to crates.io otherwise. A `pyproject.toml` that only configures tools changes nothing. touchgate releases the package of `pyproject.toml`, whose `project.version` it reads and sets, and moves `uv.lock` along if there is one. If its `build-backend` is `maturin`, the packages of the Cargo workspace move with the Python package's version, whether they are published or not, and `check` fails if they disagree. touchgate does not release pre-releases to PyPI yet, since PyPI writes them another way than Cargo.
+touchgate releases to PyPI if the repository has a `pyproject.toml` at its root with a `[project]` table. Otherwise it releases to crates.io. A `pyproject.toml` that only configures tools does not count.
 
-Use [`examples/pypi-release.yml`](examples/pypi-release.yml) as `.github/workflows/release.yml`, with your touchgate commit and key, and keep `touchgate.yml` as above. PyPI accepts no trusted publisher in a reusable workflow, and the attestations name the workflow that defines the job that publishes, so that job lives in your `release.yml`. Every step in it that does more than build or upload is a touchgate command:
+touchgate reads and sets `project.version` in `pyproject.toml`, and updates `uv.lock` if the repository has one. If the `build-backend` is `maturin`, the packages of the Cargo workspace get the same version, published or not. `check` fails if their versions differ. touchgate does not release pre-releases to PyPI yet, because PyPI writes their versions differently from Cargo.
 
-- `touchgate verify` checks the approval, as for crates.io.
-- `touchgate check --build` checks the version against the changelog before the build. For a Python package, it also fails if `uv build` would download `uv_build` from PyPI rather than use the copy built into uv, which it does when the range in `build-system.requires` leaves out the running uv. The example pins uv with `UV_VERSION`, which then pins the backend too; when you move it past the range, widen the range. A package with another backend, such as maturin, passes: uv always downloads that one.
-- `touchgate wait-for-checks` waits for every check on the merge.
-- `touchgate publish dist` checks that `dist` holds only this version's wheels and sdist, signs a PEP 740 attestation for each with `pypi-attestations`, which it installs from a lock built into touchgate that fixes every dependency by the hashes of its files, and uploads them with `uv publish` through Trusted Publishing, skipping files PyPI has already. It runs only in GitHub Actions, in a job with `id-token: write`. Updating touchgate updates how it signs and uploads.
-- `touchgate github-release dist/*` tags the release and attaches the built files.
+`examples/pypi-release.yml` runs these commands:
 
-The example builds with `uv build`. For maturin, build the wheels in the `build` job with [PyO3/maturin-action](https://github.com/PyO3/maturin-action) instead, in a matrix, and download them all into `dist`.
+- `touchgate verify` checks the approval.
+- `touchgate check --build` checks the version against the changelog. It also fails if `uv build` would download `uv_build` from PyPI instead of using the copy in uv. uv downloads it when the range in `build-system.requires` does not include the running uv. The example pins uv with `UV_VERSION`, so the backend is pinned too. When you move `UV_VERSION` past the range, widen the range. A package with another backend, such as maturin, passes, because uv always downloads that backend.
+- `touchgate wait-for-checks` waits for every check on the merge to pass.
+- `touchgate publish dist` checks that `dist` holds only the wheels and sdist of this version. It signs a PEP 740 attestation for each file with `pypi-attestations`, and uploads the files with `uv publish` through Trusted Publishing. It skips files that PyPI has already. It runs only in a GitHub Actions job with `id-token: write`.
+- `touchgate github-release dist/*` makes the tag and the GitHub release, with the built files attached.
 
-Each job installs touchgate with `cargo install --locked`, including the job that publishes, so touchgate's own locked dependencies build there. Their versions are fixed by touchgate's `Cargo.lock`.
+touchgate installs `pypi-attestations` from a lock in its own source, which fixes each dependency by the hashes of its files. A new touchgate release can update that lock.
+
+The example builds with `uv build`. For maturin, build the wheels in the `build` job with [PyO3/maturin-action](https://github.com/PyO3/maturin-action) in a matrix, and download them all into `dist`.
+
+## touchgate's own releases
+
+touchgate releases itself with its own `touchgate.yml` and `release.yml`:
+
+- `touchgate.yml` is `examples/touchgate.yml`, except that each job builds touchgate from source at the commit it runs on. CI fails if the two files differ in anything else.
+- `release.yml` builds binaries for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` with a pinned Rust version. A job that builds nothing attests them. The last job attaches them to the GitHub release.
+
+touchgate publishes nothing to crates.io.

@@ -10,7 +10,7 @@ use crate::approval;
 use crate::project::Registry;
 use crate::version::Version;
 
-/// The branch a prepared release is proposed from.
+/// Returns the branch a prepared release is proposed from.
 fn release_branch(version: &Version) -> String {
     format!("release/{version}")
 }
@@ -49,8 +49,8 @@ struct GitHubRelease {
 }
 
 impl GitHubRelease {
-    /// The release of `version`, whose notes point at `changelog`, the
-    /// changelog's path in the repository, as it reads at the tag.
+    /// Returns the release of `version`. Its notes link to `changelog`, the
+    /// path of the changelog in the repository, as it reads at the tag.
     fn of(version: &Version, changelog: &str) -> Result<Self, String> {
         let tag = format!("v{version}");
         let url = gh(&["repo", "view", "--json", "url", "--jq", ".url"])?;
@@ -63,23 +63,17 @@ impl GitHubRelease {
         })
     }
 
-    /// The release as the pull request describes it.
+    /// Returns the release as the pull request describes it.
     fn preview(&self) -> String {
         let kind = if self.pre_release {
             "a pre-release"
         } else {
             "the latest release"
         };
-        let quoted: String = self
-            .notes
-            .lines()
-            .map(|line| format!("> {line}\n"))
-            .collect();
         format!(
-            "Once published, the merge commit is tagged `{tag}` and gets this GitHub release, as {kind}:\n\n\
-             - Title: `{tag}`\n\
-             - Notes:\n\n{quoted}",
-            tag = self.tag
+            "The GitHub release `{tag}`, as {kind}, will say: {notes}",
+            tag = self.tag,
+            notes = self.notes
         )
     }
 }
@@ -111,21 +105,19 @@ pub fn pull_request(version: &Version, changelog: &str, registry: Registry) -> R
     ])?;
 
     let body = format!(
-        "This sets what the project releases to {version} and dates its section of the changelog.
+        "Releases {version} to {registry}.
 
-To approve the release, check out this branch, look it over, and once the checks pass run `touchgate approve`. It signs an empty commit with the release key, which asks for its PIN and a touch, and pushes it.
+1. When the checks pass, approve on this branch:
 
-```
-git fetch origin
-git switch {branch}
-touchgate approve
-```
+   ```
+   git fetch origin
+   git switch {branch}
+   touchgate approve
+   ```
 
-The approval names the commit of the `publish` branch the release is to run from; if that branch changes before the release, approve again. Pushing the approval also starts this pull request's checks, which a pull request opened by a workflow does not start on its own. An approval lasts an hour, so merge once they pass; if the hour runs out, approve again.
+2. Merge with a merge commit within the hour.
 
-Merge with a merge commit, never by squashing or rebasing, which would drop the signature. The release then publishes to {registry}, and tags and releases {version} on GitHub once that succeeds. If the default branch moves before the merge, merge it into this branch and approve again, since a release publishes only the exact tree that was approved.
-
-## The GitHub release
+Approve again if the hour passes or `publish` changes. If the default branch moves, merge it into this branch first.
 
 {preview}",
         preview = release.preview(),
@@ -146,10 +138,9 @@ Merge with a merge commit, never by squashing or rebasing, which would drop the 
 /// Tags `commit` and makes its GitHub release, as [`GitHubRelease::of`]
 /// describes it, with `files` attached.
 ///
-/// Anyone who can push can make tags and releases, so a tag or a release that
-/// exists already must point at `commit`, or this fails rather than dress up
-/// someone else's. A release this made before, on a run that failed later,
-/// counts as done.
+/// Anyone who can push can make tags and releases. This function therefore
+/// fails if a tag or a release exists already and points at another commit.
+/// A release that an earlier run of this function made counts as done.
 pub fn release(
     commit: &str,
     version: &Version,
@@ -296,9 +287,9 @@ pub fn wait_for_checks(commit: &str, timeout_seconds: i64) -> Result<(), String>
     }
 }
 
-/// The commit `tag` names, following an annotated tag to its commit, or
-/// `None` if there is no such tag. Any answer but the tag or a 404 is an
-/// error.
+/// Returns the commit that `tag` names, following an annotated tag to its
+/// commit. Returns `None` if there is no such tag, and an error for any answer
+/// other than the tag or a 404.
 fn tagged_commit(tag: &str) -> Result<Option<String>, String> {
     let reference = match gh(&[
         "api",

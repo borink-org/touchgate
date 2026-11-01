@@ -16,13 +16,14 @@ pub enum BuildBackend {
     Downloaded(String),
 }
 
-/// The backend `[build-system]` of `document` gets from a uv at `uv`, or why
-/// uv would download `uv_build` from PyPI rather than use its own copy.
+/// Returns the backend that the `[build-system]` of `document` gets from uv at
+/// version `uv`. Otherwise returns why uv would download `uv_build` from PyPI
+/// instead of using its own copy.
 ///
 /// uv uses its own copy when `requires` is a single `uv_build` requirement
-/// whose range holds the running uv, or one of a few older versions uv knows
-/// to build the same. touchgate asks for the running uv alone, which never
-/// passes a `uv_build` uv would download.
+/// whose range holds the running uv. uv also accepts a few older versions that
+/// it knows build the same. This function asks for the running uv only, so it
+/// never accepts a range for which uv would download `uv_build`.
 pub fn build_backend(
     document: &DocumentMut,
     uv: &pep440_rs::Version,

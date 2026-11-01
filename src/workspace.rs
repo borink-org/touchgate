@@ -23,7 +23,7 @@ pub struct Package {
 }
 
 impl Package {
-    /// The directory of the package.
+    /// Returns the directory of the package.
     pub fn dir(&self) -> &Path {
         self.manifest
             .parent()
@@ -99,12 +99,12 @@ impl Workspace {
         }
     }
 
-    /// The packages published to a registry.
+    /// Returns the packages published to a registry.
     pub fn published(&self) -> impl Iterator<Item = &Package> {
         self.packages.iter().filter(|package| package.published)
     }
 
-    /// The packages whose version the release sets.
+    /// Returns the packages whose version the release sets.
     pub fn released(&self) -> impl Iterator<Item = &Package> {
         self.packages
             .iter()
@@ -114,7 +114,7 @@ impl Workspace {
             })
     }
 
-    /// The version every released package is at.
+    /// Returns the version every released package is at.
     pub fn version(&self) -> Result<&Version, Vec<String>> {
         let mut released = self.released();
         let first = released.next().ok_or_else(|| {
@@ -215,8 +215,9 @@ impl Workspace {
     }
 }
 
-/// The dependency tables of a manifest: `[dependencies]` and its dev and build
-/// kinds, the same under each `[target.*]`, and `[workspace.dependencies]`.
+/// Returns the dependency tables of a manifest: `[dependencies]` and its dev
+/// and build kinds, the same tables under each `[target.*]`, and
+/// `[workspace.dependencies]`.
 fn dependency_tables(manifest: &mut toml_edit::Table) -> Vec<&mut dyn TableLike> {
     const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
     let mut tables: Vec<&mut dyn TableLike> = Vec::new();
@@ -288,8 +289,8 @@ fn bump_requirements(
     }
 }
 
-/// `requirement` with `new` in place of `old`, if it names exactly `old`,
-/// bare or after `=`, `^` or `~`.
+/// Returns `requirement` with `new` in place of `old`, if it names exactly
+/// `old`, bare or after `=`, `^` or `~`.
 fn bump_requirement(requirement: &str, old: &Version, new: &Version) -> Option<String> {
     let operator_len = requirement
         .find(|c: char| !matches!(c, '=' | '^' | '~' | ' '))
