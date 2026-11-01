@@ -70,16 +70,10 @@ impl GitHubRelease {
         } else {
             "the latest release"
         };
-        let quoted: String = self
-            .notes
-            .lines()
-            .map(|line| format!("> {line}\n"))
-            .collect();
         format!(
-            "Once published, the merge commit is tagged `{tag}` and gets this GitHub release, as {kind}:\n\n\
-             - Title: `{tag}`\n\
-             - Notes:\n\n{quoted}",
-            tag = self.tag
+            "The GitHub release `{tag}`, as {kind}, will say: {notes}",
+            tag = self.tag,
+            notes = self.notes
         )
     }
 }
@@ -111,12 +105,9 @@ pub fn pull_request(version: &Version, changelog: &str, registry: Registry) -> R
     ])?;
 
     let body = format!(
-        "This pull request sets what the project releases to {version} and dates its section of the changelog.
+        "Releases {version} to {registry}.
 
-To release {version}:
-
-1. Look the branch over, and wait for the checks to pass.
-2. Approve the release:
+1. When the checks pass, approve on this branch:
 
    ```
    git fetch origin
@@ -124,18 +115,9 @@ To release {version}:
    touchgate approve
    ```
 
-   The key asks for its PIN and a touch. touchgate then signs an empty commit and pushes it. The push also starts the checks of this pull request, which GitHub does not start for a pull request that a workflow opened.
-3. When the checks pass, merge with a merge commit, within an hour of approving. Squashing or rebasing drops the signature.
+2. Merge with a merge commit within the hour.
 
-The release then publishes to {registry}. When that succeeds, it tags {version} and makes the GitHub release.
-
-Approve again in these cases:
-
-- The hour has passed.
-- The default branch moved before the merge. Merge it into this branch first, because a release publishes only the exact tree that you approved.
-- The `publish` branch changed. The approval names the commit of `publish` that the release runs from.
-
-## The GitHub release
+Approve again if the hour passes or `publish` changes. If the default branch moves, merge it into this branch first.
 
 {preview}",
         preview = release.preview(),
