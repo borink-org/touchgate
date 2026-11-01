@@ -1,11 +1,10 @@
-//! The release run of GitHub Actions a command runs in: the `release.yml`
-//! started by hand with the merge commit of a release, as GitHub describes it
-//! to every job. The release commands read what they would otherwise take as
-//! flags from here, so that a `release.yml` passes them nothing.
+//! Reads the release run that a command runs in. That run is `release.yml`,
+//! started by hand with the merge commit of a release. The release commands
+//! read their values from here when you pass no flags.
 //!
-//! Every value comes from GitHub, not from an earlier step: a step can set no
-//! `GITHUB_*` variable for the steps after it, and the event file holds the
-//! inputs the run was started with.
+//! Every value comes from GitHub and none from an earlier step. A step cannot
+//! set a `GITHUB_*` variable for the steps after it. The event file holds the
+//! inputs that the run was started with.
 
 use std::path::PathBuf;
 
@@ -15,8 +14,8 @@ const EVENT_PATH: &str = "GITHUB_EVENT_PATH";
 /// The variable with the commit of the workflow file that runs.
 const WORKFLOW_SHA: &str = "GITHUB_WORKFLOW_SHA";
 
-/// The variable a `release.yml` sets to the public key of the approval key,
-/// in the workflow's `env`, where the copy on the `publish` branch fixes it.
+/// The variable that holds the public key of the approval key. A
+/// `release.yml` sets it in its `env`, so the copy on `publish` fixes it.
 pub const KEY_VARIABLE: &str = "TOUCHGATE_KEY";
 
 /// The workflow input that holds the merge commit of the release.
@@ -63,14 +62,14 @@ impl ReleaseRun {
     }
 }
 
-/// The commit of the workflow file that runs.
+/// Returns the commit of the workflow file that runs.
 pub fn workflow_commit() -> Result<String, String> {
     std::env::var(WORKFLOW_SHA).map_err(|_| {
         format!("{WORKFLOW_SHA} is not set. Outside GitHub Actions, pass --workflow-commit")
     })
 }
 
-/// The public approval key `release.yml` sets.
+/// Returns the public approval key that `release.yml` sets.
 pub fn approval_key() -> Result<String, String> {
     std::env::var(KEY_VARIABLE).map_err(|_| {
         format!("{KEY_VARIABLE} is not set. Set it in the `env` of release.yml, or pass --key")

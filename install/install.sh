@@ -1,54 +1,37 @@
 #!/usr/bin/env bash
-# Installs touchgate for the rest of the job, as `action.yml` describes: the
-# binary of the touchgate release at $COMMIT, or at the commit this action is
-# pinned to, once `gh attestation verify` shows that touchgate's release
-# workflow built it on the protected `publish` branch. With $FROM_SOURCE,
-# builds $COMMIT with cargo instead.
+# Puts touchgate on the PATH for the rest of the job, as `action.yml`
+# describes. The runner has checked out the whole touchgate commit that the
+# action is pinned to, at `_actions/borink-org/touchgate/<commit>`.
 set -euo pipefail
 
 repo=borink-org/touchgate
-bin="$RUNNER_TEMP/touchgate-bin"
-
-# A pinned action runs from `_actions/borink-org/touchgate/<ref>/install`.
-commit=${COMMIT:-$(basename "$(dirname "$GITHUB_ACTION_PATH")")}
-if [[ ! $commit =~ ^[0-9a-f]{40}$ ]]; then
-  echo "::error::pin borink-org/touchgate/install to a full commit hash, not \`$commit\`"
-  exit 1
-fi
+source=$(dirname "$GITHUB_ACTION_PATH")
+bin="$RUNNER_TEMP/touchgate/bin"
 
 if [[ $FROM_SOURCE == true ]]; then
-  cargo install --locked --root "$RUNNER_TEMP/touchgate" \
-    --git "https://github.com/$repo" --rev "$commit" touchgate
-  echo "$RUNNER_TEMP/touchgate/bin" >> "$GITHUB_PATH"
+  CARGO_TARGET_DIR="$RUNNER_TEMP/touchgate/target" \
+    cargo install --locked --path "$source" --root "$RUNNER_TEMP/touchgate"
+  echo "$bin" >> "$GITHUB_PATH"
   exit 0
 fi
 
-if [[ $RUNNER_OS != Linux ]]; then
-  echo "::error::touchgate releases binaries for Linux alone, not $RUNNER_OS"
-  exit 1
-fi
-target="$(uname -m)-unknown-linux-musl"
-
-# The release is the tag that names this commit, at the version the commit
-# gives touchgate.
-version=$(gh api "repos/$repo/contents/Cargo.toml?ref=$commit" \
-  -H 'Accept: application/vnd.github.raw' |
-  sed -n 's/^version = "\(.*\)"$/\1/p' | head -n 1)
-# gh prints the error body to stdout when there is no such tag.
-if ! tagged=$(gh api "repos/$repo/commits/v$version" --jq .sha 2>/dev/null); then
-  tagged=""
-fi
+# The release is the tag `v<version>`, which must name the pinned commit.
+commit=$(basename "$source")
+version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$source/Cargo.toml" | head -n 1)
+tagged=$(gh api "repos/$repo/commits/v$version" --jq .sha 2>/dev/null) || tagged=""
 if [[ $tagged != "$commit" ]]; then
-  echo "::error::$commit is not a touchgate release: v$version names ${tagged:-no commit}. Pin the commit of a release, or set from-source"
+  echo "::error::$commit is not the commit of a touchgate release. Pin the full commit that a release tag names, or set from-source: true"
+  exit 1
+elif [[ $RUNNER_OS != Linux ]]; then
+  echo "::error::touchgate releases binaries for Linux only, not for $RUNNER_OS"
   exit 1
 fi
 
-mkdir -p "$bin"
-gh release download "v$version" --repo "$repo" \
-  --pattern "touchgate-$target" --output "$bin/touchgate" --clobber
-gh attestation verify "$bin/touchgate" --repo "$repo" \
+file="touchgate-$(uname -m)-unknown-linux-musl"
+gh release download "v$version" --repo "$repo" --pattern "$file" --dir "$bin" --clobber
+gh attestation verify "$bin/$file" --repo "$repo" \
   --signer-workflow "$repo/.github/workflows/release.yml" \
   --source-ref refs/heads/publish --deny-self-hosted-runners
+mv "$bin/$file" "$bin/touchgate"
 chmod +x "$bin/touchgate"
 echo "$bin" >> "$GITHUB_PATH"
-echo "installed touchgate $version ($target) from $commit"

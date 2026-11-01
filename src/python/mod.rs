@@ -72,7 +72,7 @@ impl PythonPackage {
         })
     }
 
-    /// The directory of `pyproject.toml`.
+    /// Returns the directory of `pyproject.toml`.
     pub fn dir(&self) -> &Path {
         self.manifest
             .parent()
@@ -115,14 +115,13 @@ impl PythonPackage {
         Ok(())
     }
 
-    /// Checks that `uv build` would build the package with the copy of
-    /// `uv_build` built into the uv on the `PATH`, rather than download one
-    /// from PyPI, and says what it builds with. A package with another backend
-    /// passes: uv always downloads it.
+    /// Checks that `uv build` would use the copy of `uv_build` in the uv on
+    /// the `PATH` instead of downloading one from PyPI. Returns a line that
+    /// names the backend. A package with another backend passes, because uv
+    /// always downloads it.
     ///
-    /// A uv pinned in the release workflow then pins the backend as well,
-    /// which it no longer does once uv is outside the package's `uv_build`
-    /// range.
+    /// With this check, a uv pinned in the release workflow pins the backend
+    /// as well.
     pub fn check_build_backend(&self) -> Result<String, Vec<String>> {
         let output = crate::run(Command::new("uv").arg("--version"))?;
         // `uv 0.13.6 (329bf9448 2026-10-28)`
@@ -149,9 +148,9 @@ impl PythonPackage {
     }
 
     /// Uploads the built files in `dist` to PyPI, each with an attestation
-    /// that this job made it, and skips those PyPI has already, so that a
-    /// release that failed halfway can run again. `dist` must hold this
-    /// version's wheels and sdist and nothing else.
+    /// that this job made it. Skips the files that PyPI has already, so that a
+    /// release that failed halfway can run again. `dist` must hold the wheels
+    /// and sdist of this version and nothing else.
     ///
     /// The job runs with `id-token: write`: both pypi-attestations and
     /// `uv publish` take this job's identity from GitHub, and PyPI matches it
@@ -208,7 +207,8 @@ impl PythonPackage {
         }
     }
 
-    /// The files in `dist`, sorted, each a wheel or the sdist of this version.
+    /// Returns the files in `dist`, sorted, each a wheel or the sdist of this
+    /// version.
     fn release_files(&self, dist: &Path) -> Result<Vec<PathBuf>, Vec<String>> {
         let entries = std::fs::read_dir(dist)
             .map_err(|error| vec![format!("{}: {error}", dist.display())])?;
@@ -241,7 +241,7 @@ impl PythonPackage {
         }
     }
 
-    /// Whether `file` is named as a wheel or the sdist of this version.
+    /// Returns whether `file` is named as a wheel or the sdist of this version.
     fn is_release_file(&self, file: &str) -> bool {
         let prefix = format!("{}-{}", file_name_part(&self.name), self.version);
         match file.strip_prefix(&prefix) {
@@ -252,16 +252,18 @@ impl PythonPackage {
     }
 }
 
-/// Where `pypi-attestations sign` writes the attestation of `file`, the path
-/// `uv publish` pairs with it: `frc-0.1.2.tar.gz.publish.attestation`.
+/// Returns the path where `pypi-attestations sign` writes the attestation of
+/// `file`, such as `frc-0.1.2.tar.gz.publish.attestation`. `uv publish` pairs
+/// the file with that path.
 fn publish_attestation(file: &Path) -> PathBuf {
     let mut path = file.as_os_str().to_owned();
     path.push(".publish.attestation");
     PathBuf::from(path)
 }
 
-/// `name` as the file names of its wheels and sdists write it: lower case,
-/// with each run of `-`, `_` and `.` turned into one `_`.
+/// Returns `name` as the file names of its wheels and sdists write it. The
+/// result is lower case, with each run of `-`, `_` and `.` turned into one
+/// `_`.
 fn file_name_part(name: &str) -> String {
     let mut part = String::with_capacity(name.len());
     for c in name.chars() {

@@ -1,9 +1,10 @@
 //! `touchgate verify` against approvals signed as a FIDO2 key signs them,
 //! checked by the real git and `ssh-keygen`.
 //!
-//! A software key stands in for the security key: it signs the authenticator
-//! data of `sk-ssh-ed25519@openssh.com` with whatever flags a test asks for,
-//! which is what a security key asked for a silent assertion would do too.
+//! A software key takes the place of the security key. It signs the
+//! authenticator data of `sk-ssh-ed25519@openssh.com` with the flags that a
+//! test asks for. A security key asked for a silent assertion signs the same
+//! way.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -378,9 +379,10 @@ fn public_key_line(key: &SigningKey) -> String {
     format!("{SK} {} test", base64(&key_blob(key)))
 }
 
-/// An SSHSIG signature of `message` as a FIDO2 key makes it: the key signs
-/// the hash of the application, the flags, a counter and the hash of the
-/// signed data. `claimed` is the flags byte written into the signature.
+/// Returns an SSHSIG signature of `message`, made the way a FIDO2 key makes
+/// it. The key signs the hash of the application, the flags, a counter and
+/// the hash of the signed data. `claimed` is the flags byte written into the
+/// signature.
 fn sign(key: &SigningKey, message: &[u8], flags: u8, claimed: u8) -> String {
     let signed = [
         &b"SSHSIG"[..],

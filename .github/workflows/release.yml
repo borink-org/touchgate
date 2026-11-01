@@ -1,10 +1,10 @@
-# The release of touchgate itself, started by `touchgate start` once a merge
-# brings in an approval. The copy on the publish branch is the one that runs.
+# touchgate's own release. `touchgate start` starts it when a merge brings in
+# an approval, and the copy on `publish` runs.
 #
-# It builds static Linux binaries of the release, attests them with GitHub's
+# It builds static Linux binaries of the release, attests them with GitHub
 # artifact attestations and attaches them to the GitHub release. The install
-# action, `install/action.yml`, downloads one only if its attestation names
-# this file on `publish`. Nothing is published to crates.io.
+# action installs a binary only if its attestation names this file on
+# `publish`. It publishes nothing to crates.io.
 name: release
 
 on:
@@ -20,12 +20,12 @@ permissions: {}
 env:
   CARGO_TERM_COLOR: always
   TOUCHGATE_KEY: sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIPK8VZox0UVPB1gsQowDPXlOj1Z34IIJ3V4I2chFNYONAAAAC3NzaDpzaWduaW5n release key
-  # The toolchain the binaries are built with.
+  # The Rust version that builds the binaries.
   RUST_TOOLCHAIN: 1.99.1
 
 jobs:
-  # Checks the approval with the touchgate of this workflow's own commit,
-  # built before the checkout, without running anything from the release.
+  # Checks the approval with touchgate built from this workflow's own commit.
+  # touchgate is built before the checkout and runs nothing from the release.
   verify:
     name: Check the approval
     runs-on: ubuntu-latest
@@ -99,9 +99,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-  # Runs nothing from the release: signs that this workflow, on `publish`,
-  # built these files. The build jobs, which run every dependency's build
-  # scripts, cannot get the token this needs.
+  # Runs nothing from the release. It signs that this workflow, on
+  # `publish`, built these files. The build jobs run the build scripts of
+  # every dependency, so they cannot get the token that signing needs.
   attest:
     name: Attest the binaries
     needs: [build, checks]
@@ -120,7 +120,7 @@ jobs:
         with:
           subject-path: dist/touchgate-*
 
-  # Only now does the tag exist, so a tag always names an attested release.
+  # This job runs last, so a tag always names an attested release.
   github-release:
     name: Tag and release on GitHub
     needs: attest

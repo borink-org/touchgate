@@ -1,7 +1,6 @@
-# touchgate run on itself: examples/touchgate.yml, except that each job
-# builds touchgate from source at the commit it runs on, which is not a
-# release yet, with the install action of that same commit. Keep the two in
-# step.
+# touchgate's own copy of examples/touchgate.yml. Each install step builds
+# touchgate from source at the commit that the workflow runs on, because that
+# commit is not a release. CI fails if the two files differ in anything else.
 name: touchgate
 
 on:
@@ -14,7 +13,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    # The three default types, and a label change, so that adding no-changelog
+    # The three default types and the label changes. Adding no-changelog then
     # runs the changelog check again.
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
@@ -36,12 +35,11 @@ jobs:
     steps:
       - uses: $/install
         with:
-          commit: ${{ github.sha }}
           from-source: true
       # The credentials stay, to push the release branch. They can do no more
       # than anyone who can start this workflow.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 # zizmor: ignore[artipacked]
-      # For a Python package, preparing a release moves uv.lock along.
+      # For a Python package, `touchgate prepare` updates uv.lock.
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: 0.13.6
@@ -64,7 +62,6 @@ jobs:
     steps:
       - uses: $/install
         with:
-          commit: ${{ github.sha }}
           from-source: true
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -92,7 +89,6 @@ jobs:
     steps:
       - uses: $/install
         with:
-          commit: ${{ github.sha }}
           from-source: true
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -1,17 +1,18 @@
-//! pypi-attestations, which signs the PEP 740 attestations of a release, as
-//! `touchgate publish` installs it: from a lock that fixes every file by its
-//! hash.
+//! Installs pypi-attestations, which signs the PEP 740 attestations of a
+//! release, from a lock that fixes every file by its hash.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-/// pypi-attestations, the library pypa/gh-action-pypi-publish signs with, and
-/// everything it runs on, each at one version with the hashes of its files.
-/// The job that can get a PyPI token installs exactly these files to sign a
-/// release's attestations. uv lists the hash of every file of each version,
-/// for every platform and Python, which makes it long: most of it is the
-/// wheels of charset-normalizer, pydantic-core, cffi and cryptography.
-/// Regenerate it in the repository's root with today's date:
+/// The requirements file for pypi-attestations and its dependencies, each at
+/// one version with the hashes of its files. pypa/gh-action-pypi-publish signs
+/// with the same library. The job that can get a PyPI token installs exactly
+/// these files.
+///
+/// uv lists the hash of every file of each version, for every platform and
+/// Python version. Most of the file is the wheels of charset-normalizer,
+/// pydantic-core, cffi and cryptography. Regenerate it in the repository's
+/// root with today's date:
 ///
 /// ```sh
 /// echo pypi-attestations==0.0.30 | uv pip compile - --universal \
@@ -71,7 +72,8 @@ impl AttestationSigner {
         Ok(())
     }
 
-    /// `pypi-attestations` in the virtual environment.
+    /// Returns a command that runs `pypi-attestations` in the virtual
+    /// environment.
     pub fn command(&self) -> Command {
         Command::new(self.dir.join("venv/bin/pypi-attestations"))
     }
