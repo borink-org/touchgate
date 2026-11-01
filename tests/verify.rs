@@ -7,7 +7,7 @@
 //! way.
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,115 +17,129 @@ use sha2::{Digest, Sha256, Sha512};
 const SK: &str = "sk-ssh-ed25519@openssh.com";
 const APPLICATION: &str = "ssh:signing";
 const PRESENT_AND_VERIFIED: u8 = 0x05;
+/// The namespace touchgate signs approvals in.
+const NAMESPACE: &str = "touchgate-release";
 /// The commit of the publish branch the test releases run from.
 const WORKFLOW: &str = "1111111111111111111111111111111111111111";
-/// An approval as `touchgate approve` writes it.
-const MESSAGE: &str =
-    "Approve release 0.1.0.\n\nRelease-Workflow: 1111111111111111111111111111111111111111\n";
+const REPOSITORY: &str = "o/r";
+/// A prepared changelog. The fixture puts the date of the approval for DATE.
+const PREPARED: &str = "# Changelog\n\n## 0.1.0 - DATE\n\n- First.\n";
 
 #[test]
 fn accepts_an_approval_made_with_touch_and_pin() {
-    let release = Release::new(PRESENT_AND_VERIFIED);
-    let output = release.verify();
+    let release = Release::build(Options::default());
+    let outputs = release.dir.join("outputs");
+    std::fs::write(&outputs, "").unwrap();
+    let output = release
+        .verify_command(&release.key)
+        .env("GITHUB_OUTPUT", &outputs)
+        .output()
+        .unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(
-        String::from_utf8(output.stdout.clone()).unwrap().trim(),
-        release.approval
+        String::from_utf8(output.stdout).unwrap().trim(),
+        release.commit
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outputs).unwrap(),
+        format!("commit={}\nversion=0.1.0\n", release.commit)
     );
 }
 
 #[test]
 fn refuses_an_approval_made_without_the_pin() {
-    let output = Release::new(0x01).verify();
-    assert!(
-        stderr(&output).contains("without the key's PIN"),
-        "{}",
-        stderr(&output)
-    );
+    let output = Release::build(Options {
+        flags: 0x01,
+        claimed: 0x01,
+        ..Options::default()
+    })
+    .verify();
+    assert_refused(&output, "without the key's PIN");
 }
 
 #[test]
-fn refuses_a_silent_approval_that_git_accepts() {
-    let release = Release::new(0x00);
-    let output = release.verify();
-    assert!(
-        stderr(&output).contains("without a touch"),
-        "{}",
-        stderr(&output)
-    );
-    // What touchgate is for: git alone takes the silent signature.
+fn refuses_a_silent_approval_that_ssh_keygen_accepts() {
+    let release = Release::build(Options {
+        flags: 0x00,
+        claimed: 0x00,
+        ..Options::default()
+    });
+    assert_refused(&release.verify(), "without a touch");
+    // What touchgate is for: ssh-keygen alone takes the silent signature.
+    let text = std::fs::read_to_string(&release.approval).unwrap();
+    let split = text.find("-----BEGIN").unwrap();
+    let (message, signature) = text.split_at(split);
     let allowed = release.dir.join("allowed_signers");
+    let signature_file = release.dir.join("signature");
     std::fs::write(&allowed, format!("someone {}\n", release.key)).unwrap();
-    let git = release
-        .git()
-        .args(["-c", "gpg.format=ssh", "-c"])
-        .arg(format!("gpg.ssh.allowedSignersFile={}", allowed.display()))
-        .args(["verify-commit", &release.approval])
-        .output()
+    std::fs::write(&signature_file, signature).unwrap();
+    let mut child = Command::new("ssh-keygen")
+        .args(["-Y", "verify", "-n", NAMESPACE, "-I", "someone", "-f"])
+        .arg(&allowed)
+        .arg("-s")
+        .arg(&signature_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
-    assert!(git.status.success(), "{}", stderr(&git));
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), message.as_bytes()).unwrap();
+    let ssh_keygen = child.wait_with_output().unwrap();
+    assert!(ssh_keygen.status.success(), "{}", stderr(&ssh_keygen));
 }
 
 #[test]
 fn refuses_flags_changed_after_signing() {
-    let release = Release::build(0x00, PRESENT_AND_VERIFIED, false, 0, MESSAGE);
-    let output = release.verify();
-    assert!(
-        stderr(&output).contains("is invalid"),
-        "{}",
-        stderr(&output)
-    );
+    let output = Release::build(Options {
+        flags: 0x00,
+        ..Options::default()
+    })
+    .verify();
+    assert_refused(&output, "is invalid");
 }
 
 #[test]
-fn refuses_a_merge_that_brings_in_unapproved_changes() {
-    let output =
-        Release::build(PRESENT_AND_VERIFIED, PRESENT_AND_VERIFIED, true, 0, MESSAGE).verify();
-    assert!(
-        stderr(&output).contains("another tree"),
-        "{}",
-        stderr(&output)
-    );
+fn refuses_a_message_changed_after_signing() {
+    let release = Release::build(Options::default());
+    let text = std::fs::read_to_string(&release.approval).unwrap();
+    std::fs::write(
+        &release.approval,
+        text.replace(&release.commit, &release.base),
+    )
+    .unwrap();
+    assert_refused(&release.verify(), "is invalid");
 }
 
 #[test]
 fn refuses_another_key() {
-    let release = Release::new(PRESENT_AND_VERIFIED);
+    let release = Release::build(Options::default());
     let other = public_key_line(&SigningKey::from_bytes(&[9; 32]));
-    let output = release.verify_with(&other);
-    assert!(
-        stderr(&output).contains("another key"),
-        "{}",
-        stderr(&output)
-    );
+    assert_refused(&release.verify_with(&other), "another key");
+}
+
+#[test]
+fn refuses_a_commit_signature_made_with_the_same_key() {
+    let output = Release::build(Options {
+        namespace: "git",
+        ..Options::default()
+    })
+    .verify();
+    assert_refused(&output, "namespace `git`");
 }
 
 #[test]
 fn refuses_a_stale_approval() {
-    let two_hours = 2 * 3_600;
-    let release = Release::build(
-        PRESENT_AND_VERIFIED,
-        PRESENT_AND_VERIFIED,
-        false,
-        two_hours,
-        MESSAGE,
+    let release = Release::build(Options {
+        age: 2 * 3_600,
+        ..Options::default()
+    });
+    assert_refused(
+        &release.verify(),
+        "2 hours old, older than the 15 minutes an approval lasts",
     );
-    let output = release.verify();
-    let expected = "2 hours old, older than the 60 minutes an approval lasts";
-    assert!(stderr(&output).contains(expected), "{}", stderr(&output));
     // A longer limit admits it.
-    let longer = Command::new(env!("CARGO_BIN_EXE_touchgate"))
-        .args(["verify", "--repo"])
-        .arg(&release.dir)
-        .args([
-            "--commit",
-            &release.merge,
-            "--branch",
-            "main",
-            "--key",
-            &release.key,
-        ])
-        .args(["--workflow-commit", WORKFLOW])
+    let longer = release
+        .verify_command(&release.key)
         .args(["--max-age", "3h"])
         .output()
         .unwrap();
@@ -133,191 +147,208 @@ fn refuses_a_stale_approval() {
 }
 
 #[test]
-fn ignores_replacement_objects() {
-    // A merge of the unsigned prepare commit, which a `refs/replace/` ref
-    // tries to pass off as the approved merge.
-    let release = Release::new(PRESENT_AND_VERIFIED);
-    let tree = release.run(&["rev-parse", &format!("{}^{{tree}}", release.merge)]);
-    let bogus = release.run(&[
-        "commit-tree",
-        &tree,
-        "-p",
-        &release.base,
-        "-p",
-        &release.prepared,
-        "-m",
-        "Merge.",
-    ]);
-    release.run(&["replace", &bogus, &release.merge]);
-    release.run(&["update-ref", "refs/heads/main", &bogus]);
-    let output = Command::new(env!("CARGO_BIN_EXE_touchgate"))
-        .args(["verify", "--repo"])
-        .arg(&release.dir)
-        .args([
-            "--commit",
-            &bogus,
-            "--branch",
-            "main",
-            "--key",
-            &release.key,
-        ])
-        .args(["--workflow-commit", WORKFLOW])
-        .output()
-        .unwrap();
-    assert!(
-        stderr(&output).contains("not an approval"),
-        "{}",
-        stderr(&output)
-    );
-}
-
-#[test]
 fn refuses_a_release_from_a_changed_publish_branch() {
-    let release = Release::new(PRESENT_AND_VERIFIED);
-    let output = Command::new(env!("CARGO_BIN_EXE_touchgate"))
-        .args(["verify", "--repo"])
-        .arg(&release.dir)
-        .args([
-            "--commit",
-            &release.merge,
-            "--branch",
-            "main",
-            "--key",
-            &release.key,
-        ])
+    let release = Release::build(Options::default());
+    let output = release
+        .verify_command(&release.key)
         .args([
             "--workflow-commit",
             "2222222222222222222222222222222222222222",
         ])
         .output()
         .unwrap();
-    assert!(
-        stderr(&output).contains("publish branch changed"),
-        "{}",
-        stderr(&output)
-    );
+    assert_refused(&output, "publish branch changed");
 }
 
 #[test]
-fn refuses_an_approval_that_names_no_publish_commit() {
-    let release = Release::build(
-        PRESENT_AND_VERIFIED,
-        PRESENT_AND_VERIFIED,
-        false,
-        0,
-        "Approve release 0.1.0.\n",
-    );
-    let output = release.verify();
-    assert!(stderr(&output).contains("no single"), "{}", stderr(&output));
+fn refuses_an_approval_for_another_repository() {
+    let release = Release::build(Options::default());
+    let output = release
+        .verify_command(&release.key)
+        .args(["--repository", "o/other"])
+        .output()
+        .unwrap();
+    assert_refused(&output, "is for o/r, not for o/other");
 }
 
-/// A repository whose `main` ends in the merge of a signed approval.
+#[test]
+fn refuses_a_commit_that_is_not_on_the_default_branch() {
+    let output = Release::build(Options {
+        off_main: true,
+        ..Options::default()
+    })
+    .verify();
+    assert_refused(&output, "is not on main");
+}
+
+#[test]
+fn refuses_another_version_than_the_changelog_releases() {
+    let output = Release::build(Options {
+        version: "0.2.0",
+        ..Options::default()
+    })
+    .verify();
+    assert_refused(&output, "the approval is for 0.2.0, but");
+}
+
+#[test]
+fn refuses_a_release_dated_before_the_day_of_the_approval() {
+    let output = Release::build(Options {
+        changelog: "# Changelog\n\n## 0.1.0 - 2026-01-01\n\n- First.\n",
+        ..Options::default()
+    })
+    .verify();
+    assert_refused(&output, "dates 0.1.0 2026-01-01, before the approval on");
+}
+
+#[test]
+fn refuses_a_commit_with_unreleased_entries_hidden_by_a_replacement() {
+    let release = Release::build(Options {
+        changelog: "# Changelog\n\n## Unreleased\n\n- Second.\n\n## 0.1.0 - DATE\n\n- First.\n",
+        ..Options::default()
+    });
+    assert_refused(&release.verify(), "entries under `## Unreleased`");
+    // A `refs/replace/` ref that answers for the commit with a clean one
+    // changes nothing.
+    std::fs::write(release.dir.join("CHANGELOG.md"), &release.prepared).unwrap();
+    release.run(&["commit", "-qam", "Clean."]);
+    let clean = release.run(&["rev-parse", "HEAD"]);
+    release.run(&["replace", &release.commit, &clean]);
+    assert_refused(&release.verify(), "entries under `## Unreleased`");
+}
+
+/// What a test changes about the release and its approval.
+struct Options {
+    /// The flags the key signs with.
+    flags: u8,
+    /// The flags written into the signature.
+    claimed: u8,
+    namespace: &'static str,
+    /// How many seconds ago the approval was signed.
+    age: u64,
+    /// The version the approval names.
+    version: &'static str,
+    /// The changelog of the released commit, with the date of the approval
+    /// for DATE.
+    changelog: &'static str,
+    /// Whether the released commit is on a branch of its own, not on `main`.
+    off_main: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            flags: PRESENT_AND_VERIFIED,
+            claimed: PRESENT_AND_VERIFIED,
+            namespace: NAMESPACE,
+            age: 0,
+            version: "0.1.0",
+            changelog: PREPARED,
+            off_main: false,
+        }
+    }
+}
+
+/// A repository whose `main` ends in a prepared release, and a signed
+/// approval of it in a file beside the repository.
 struct Release {
     dir: PathBuf,
     key: String,
     base: String,
+    commit: String,
+    approval: PathBuf,
+    /// [`PREPARED`], dated the day of the approval.
     prepared: String,
-    approval: String,
-    merge: String,
 }
 
 impl Release {
-    fn new(flags: u8) -> Self {
-        Self::build(flags, flags, false, 0, MESSAGE)
-    }
-
-    /// Signs the approval with `flags`, and writes `claimed` as its flags.
-    /// With `moved`, `main` gains a commit before the merge. The approval is
-    /// dated `age` seconds ago.
-    fn build(flags: u8, claimed: u8, moved: bool, age: u64, message: &str) -> Self {
+    fn build(options: Options) -> Self {
         // Tests run in parallel, so each repository gets a directory of its own.
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "touchgate-test-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("repo");
         std::fs::create_dir_all(&dir).unwrap();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let mut release = Self {
             dir,
             key: public_key_line(&signing_key),
             base: String::new(),
+            commit: String::new(),
+            approval: root.join("approval.txt"),
             prepared: String::new(),
-            approval: String::new(),
-            merge: String::new(),
         };
-
-        release.run(&["init", "-q", "-b", "main"]);
-        std::fs::write(release.dir.join("f"), "1\n").unwrap();
-        release.run(&["add", "f"]);
-        release.run(&["commit", "-qm", "Base."]);
-        let base = release.run(&["rev-parse", "HEAD"]);
-        std::fs::write(release.dir.join("f"), "2\n").unwrap();
-        release.run(&["commit", "-qam", "Prepare the 0.1.0 release."]);
-        let prepared = release.run(&["rev-parse", "HEAD"]);
-        let tree = release.run(&["rev-parse", "HEAD^{tree}"]);
-        release.base = base.clone();
-        release.prepared = prepared.clone();
-
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let identity = format!("T <t@example.com> {} +0000", now - age);
-        let unsigned = format!(
-            "tree {tree}\nparent {prepared}\nauthor {identity}\ncommitter {identity}\n\n{message}"
-        );
-        let armored = sign(&signing_key, unsigned.as_bytes(), flags, claimed);
-        let signed = unsigned.replacen(
-            "\n\n",
-            &format!("\ngpgsig {}\n\n", armored.replace('\n', "\n ")),
-            1,
-        );
-        release.approval = release.run_with_input(
-            &["hash-object", "-t", "commit", "-w", "--stdin"],
-            signed.as_bytes(),
-        );
+        let time = now - options.age;
+        let date = utc_date(time);
+        release.prepared = PREPARED.replace("DATE", &date);
 
-        if moved {
-            release.run(&["checkout", "-q", &base]);
-            std::fs::write(release.dir.join("g"), "x\n").unwrap();
-            release.run(&["add", "g"]);
-            release.run(&["commit", "-qm", "Other."]);
-            let approval = release.approval.clone();
-            release.run(&["merge", "-q", "--no-ff", "-m", "Merge.", &approval]);
-            release.merge = release.run(&["rev-parse", "HEAD"]);
-        } else {
-            let approval = release.approval.clone();
-            release.merge = release.run(&[
-                "commit-tree",
-                &tree,
-                "-p",
-                &base,
-                "-p",
-                &approval,
-                "-m",
-                "Merge.",
-            ]);
+        release.run(&["init", "-q", "-b", "main"]);
+        std::fs::write(
+            release.dir.join("CHANGELOG.md"),
+            "# Changelog\n\n## Unreleased\n\n- First.\n",
+        )
+        .unwrap();
+        release.run(&["add", "CHANGELOG.md"]);
+        release.run(&["commit", "-qm", "Base."]);
+        release.base = release.run(&["rev-parse", "HEAD"]);
+        if options.off_main {
+            release.run(&["switch", "-qc", "other"]);
         }
-        let merge = release.merge.clone();
-        release.run(&["update-ref", "refs/heads/main", &merge]);
+        std::fs::write(
+            release.dir.join("CHANGELOG.md"),
+            options.changelog.replace("DATE", &date),
+        )
+        .unwrap();
+        release.run(&["commit", "-qam", "Prepare the 0.1.0 release."]);
+        release.commit = release.run(&["rev-parse", "HEAD"]);
+        if options.off_main {
+            release.run(&["switch", "-q", "main"]);
+        }
+
+        let message = format!(
+            "touchgate release approval\nrepository: {REPOSITORY}\ncommit: {}\nversion: {}\n\
+             workflow-commit: {WORKFLOW}\ntime: {}\n",
+            release.commit, options.version, time
+        );
+        let armored = sign(
+            &signing_key,
+            message.as_bytes(),
+            options.namespace,
+            options.flags,
+            options.claimed,
+        );
+        std::fs::write(&release.approval, format!("{message}{armored}\n")).unwrap();
         release
     }
 
-    fn verify(&self) -> std::process::Output {
+    fn verify(&self) -> Output {
         self.verify_with(&self.key)
     }
 
-    fn verify_with(&self, key: &str) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_touchgate"))
+    fn verify_with(&self, key: &str) -> Output {
+        self.verify_command(key).output().unwrap()
+    }
+
+    /// Returns `touchgate verify` with every value as a flag. A flag given
+    /// again after these takes the place of the first.
+    fn verify_command(&self, key: &str) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_touchgate"));
+        command
             .args(["verify", "--repo"])
             .arg(&self.dir)
-            .args(["--commit", &self.merge, "--branch", "main", "--key", key])
-            .args(["--workflow-commit", WORKFLOW])
-            .output()
-            .unwrap()
+            .arg("--approval")
+            .arg(&self.approval)
+            .args(["--branch", "main", "--repository", REPOSITORY, "--key", key])
+            .args(["--workflow-commit", WORKFLOW]);
+        command
     }
 
     fn git(&self) -> Command {
@@ -331,20 +362,7 @@ impl Release {
     }
 
     fn run(&self, args: &[&str]) -> String {
-        self.run_with_input(args, b"")
-    }
-
-    fn run_with_input(&self, args: &[&str], input: &[u8]) -> String {
-        let mut child = self
-            .git()
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        std::io::Write::write_all(&mut child.stdin.take().unwrap(), input).unwrap();
-        let output = child.wait_with_output().unwrap();
+        let output = self.git().args(args).output().unwrap();
         assert!(output.status.success(), "git {args:?}: {}", stderr(&output));
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
@@ -352,11 +370,33 @@ impl Release {
 
 impl Drop for Release {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if let Some(root) = self.dir.parent() {
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 }
 
-fn stderr(output: &std::process::Output) -> String {
+/// Returns the UTC date of `seconds` since the Unix epoch, as YYYY-MM-DD,
+/// with Howard Hinnant's `civil_from_days`.
+fn utc_date(seconds: u64) -> String {
+    let z = (seconds / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn assert_refused(output: &Output, expected: &str) {
+    assert!(!output.status.success(), "verify passed");
+    assert!(stderr(output).contains(expected), "{}", stderr(output));
+}
+
+fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).unwrap()
 }
 
@@ -383,10 +423,10 @@ fn public_key_line(key: &SigningKey) -> String {
 /// it. The key signs the hash of the application, the flags, a counter and
 /// the hash of the signed data. `claimed` is the flags byte written into the
 /// signature.
-fn sign(key: &SigningKey, message: &[u8], flags: u8, claimed: u8) -> String {
+fn sign(key: &SigningKey, message: &[u8], namespace: &str, flags: u8, claimed: u8) -> String {
     let signed = [
         &b"SSHSIG"[..],
-        &string(b"git"),
+        &string(namespace.as_bytes()),
         &string(b""),
         &string(b"sha512"),
         &string(&Sha512::digest(message)),
@@ -412,7 +452,7 @@ fn sign(key: &SigningKey, message: &[u8], flags: u8, claimed: u8) -> String {
         &b"SSHSIG"[..],
         &1u32.to_be_bytes(),
         &string(&key_blob(key)),
-        &string(b"git"),
+        &string(namespace.as_bytes()),
         &string(b""),
         &string(b"sha512"),
         &string(&signature_blob),

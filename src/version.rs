@@ -155,8 +155,13 @@ impl Date {
             .duration_since(UNIX_EPOCH)
             .expect("the clock is after 1970")
             .as_secs();
+        Self::of_unix_time(seconds as i64)
+    }
+
+    /// Returns the UTC date of a time in seconds since the Unix epoch.
+    pub fn of_unix_time(seconds: i64) -> Self {
         // Howard Hinnant's `civil_from_days`, for days since 1970-01-01.
-        let z = (seconds / 86_400) as i64 + 719_468;
+        let z = seconds.div_euclid(86_400) + 719_468;
         let era = z.div_euclid(146_097);
         let doe = z.rem_euclid(146_097);
         let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;

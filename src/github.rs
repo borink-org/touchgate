@@ -2,15 +2,13 @@
 //! GitHub's runners carry. `gh` finds the repository from the checkout, and
 //! its token from `GH_TOKEN`.
 
-use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::approval;
+use crate::approval::{self, SignedApproval};
 use crate::project::Registry;
 use crate::version::Version;
 
-/// Returns the branch a prepared release is proposed from.
 /// Whether a release pull request prepares a new version, or the version that
 /// the changelog dates already, for a release that has not published yet.
 #[derive(Clone, Copy)]
@@ -18,8 +16,7 @@ pub enum Preparation {
     /// The changelog and the version files change to the new version.
     New,
     /// The changelog moves any new entries into the section of the version,
-    /// and the branch gets a commit even if nothing changed, so that a new
-    /// approval can go on top of it.
+    /// which it dates anew.
     Again,
 }
 
@@ -44,32 +41,62 @@ pub fn is_released(version: &Version) -> Result<bool, String> {
     Ok(tagged_commit(&release_tag(version))?.is_some())
 }
 
+/// Returns the branch a prepared release is proposed from.
 fn release_branch(version: &Version) -> String {
     format!("release/{version}")
 }
 
-/// Starts `release.yml` on the `publish` branch if the merge `commit` brings
-/// in an approval. Whether the approval holds is for that workflow to check.
-pub fn start(commit: &str) -> Result<(), String> {
-    match approval::merged_approval(Path::new("."), commit)? {
-        None => {
-            println!("{commit} merges no approval");
-            Ok(())
-        }
-        Some(approval) => {
-            println!("{commit} merges the approval {approval}; starting the release");
-            gh(&[
-                "workflow",
-                "run",
-                "release.yml",
-                "--ref",
-                "publish",
-                "-f",
-                &format!("commit={commit}"),
-            ])
-            .map(drop)
-        }
+/// Starts `release.yml` on the `publish` branch with `approval`. Whether
+/// the approval holds is for that workflow to check.
+pub fn start_release(approval: &SignedApproval) -> Result<(), String> {
+    gh(&[
+        "workflow",
+        "run",
+        "release.yml",
+        "--ref",
+        "publish",
+        "--raw-field",
+        &format!("approval={}", approval.text()),
+    ])?;
+    println!(
+        "Started release.yml on publish. Follow it with `gh run watch`, or at {}/actions",
+        repository_url()?
+    );
+    Ok(())
+}
+
+/// The repository that `gh` works on, as `touchgate approve` needs it.
+pub struct Repository {
+    /// As `owner/name`.
+    pub name: String,
+    pub default_branch: String,
+}
+
+impl Repository {
+    /// Asks GitHub for the repository of the checkout.
+    pub fn of_checkout() -> Result<Self, String> {
+        let text = gh(&[
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner,defaultBranchRef",
+            "--jq",
+            ".nameWithOwner + \" \" + .defaultBranchRef.name",
+        ])?;
+        let (name, branch) = text
+            .trim_end()
+            .split_once(' ')
+            .ok_or_else(|| format!("gh repo view: `{}`", text.trim_end()))?;
+        Ok(Self {
+            name: name.to_owned(),
+            default_branch: branch.to_owned(),
+        })
     }
+}
+
+/// Returns the URL of the repository on GitHub.
+fn repository_url() -> Result<String, String> {
+    gh(&["repo", "view", "--json", "url", "--jq", ".url"]).map(|url| url.trim_end().to_owned())
 }
 
 /// The GitHub release a version gets: what [`release`] makes, and what the
@@ -86,9 +113,9 @@ impl GitHubRelease {
     /// path of the changelog in the repository, as it reads at the tag.
     fn of(version: &Version, changelog: &str) -> Result<Self, String> {
         let tag = release_tag(version);
-        let url = gh(&["repo", "view", "--json", "url", "--jq", ".url"])?;
+        let url = repository_url()?;
         let name = changelog.rsplit('/').next().unwrap_or(changelog);
-        let notes = format!("See [{name}]({}/blob/{tag}/{changelog}).", url.trim_end());
+        let notes = format!("See [{name}]({url}/blob/{tag}/{changelog}).");
         Ok(Self {
             tag,
             notes,
@@ -122,6 +149,10 @@ pub fn pull_request(
     registry: Registry,
 ) -> Result<(), String> {
     let release = GitHubRelease::of(version, changelog)?;
+    if git(&["status", "--porcelain"])?.is_empty() {
+        println!("{version} needs no change: approve the default branch with `touchgate approve`");
+        return Ok(());
+    }
     let branch = release_branch(version);
     git(&["switch", "--create", &branch])?;
     git(&[
@@ -131,7 +162,6 @@ pub fn pull_request(
         "user.email=41898282+github-actions[bot]@users.noreply.github.com",
         "commit",
         "--all",
-        "--allow-empty",
         "--no-verify",
         "--message",
         &preparation.commit_message(version),
@@ -144,25 +174,19 @@ pub fn pull_request(
     ])?;
 
     let body = format!(
-        "Releases {version} to {registry}.
+        "Prepares the release of {version} to {registry}.
 
-1. When the checks pass, approve on this branch:
+Merge it in any way. Then approve the merged commit on the default branch, which starts the release:
 
-   ```
-   git fetch origin
-   git switch {branch}
-   touchgate approve
-   ```
-
-2. Merge with a merge commit within the hour.
-
-Approve again if the hour passes or `publish` changes. If the default branch moves, merge it into this branch first.
+```
+touchgate approve
+```
 
 {preview}",
         preview = release.preview(),
         registry = registry.name()
     );
-    let title = format!("Release {version}.");
+    let title = preparation.commit_message(version);
     match gh(&[
         "pr", "create", "--head", &branch, "--title", &title, "--body", &body,
     ]) {

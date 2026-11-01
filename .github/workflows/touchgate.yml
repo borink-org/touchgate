@@ -72,29 +72,6 @@ jobs:
         if: >-
           github.event_name == 'pull_request'
           && !contains(github.event.pull_request.labels.*.name, 'no-changelog')
-          && !startsWith(github.head_ref, 'release/')
         env:
           BASE: origin/${{ github.base_ref }}
         run: 'touchgate check-entry "$BASE"'
-
-  start:
-    name: Start the release
-    if: >-
-      github.event_name == 'push'
-      && github.ref_name == github.event.repository.default_branch
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read # to read the merge
-      actions: write # to start release.yml
-    steps:
-      - uses: $/install
-        with:
-          from-source: true
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 2
-          persist-credentials: false
-      - name: Start the release if this push merges an approval
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: 'touchgate start --commit "$GITHUB_SHA"'

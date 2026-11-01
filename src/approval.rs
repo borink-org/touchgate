@@ -1,14 +1,12 @@
 //! The check that a person approved a release with a hardware key, by touch
 //! and PIN.
 //!
-//! A release is a merge commit on the release branch. Its second parent is the
-//! approval, which must meet three conditions:
-//!
-//! - Its subject starts with `Approve release`.
-//! - It is signed with a FIDO2 SSH key, `sk-ssh-ed25519` or
-//!   `sk-ecdsa-sha2-nistp256`.
-//! - It has the same tree as the merge, so the signature covers exactly what
-//!   is released.
+//! An approval is a short message that names the repository, the commit to
+//! release, its version, the commit of the `publish` branch that the release
+//! is to run from, and the time it was signed. [`SignedApproval::text`] holds
+//! the message and its SSH signature, and `touchgate approve` starts
+//! `release.yml` with that text as its `approval` input. Nothing about the
+//! approval lives in git, so approving adds no commit and starts no CI.
 //!
 //! `ssh-keygen -Y verify` checks the signature against the one key allowed.
 //! It does not check how the key made the signature. The allowed-signers
@@ -17,75 +15,331 @@
 //! flags byte along with the message. This module reads that byte and
 //! requires user presence and user verification.
 //!
-//! Nothing here runs code from the commits it checks. Until the check passes,
+//! The signature is made in the namespace `touchgate-release`, not `git`. A
+//! signature covers its namespace, so a commit signature made with the same
+//! key can never pass as an approval, nor an approval as a commit signature.
+//!
+//! Nothing here runs code from the commit it checks. Until the check passes,
 //! the tree is untrusted, and anything that builds it or runs `cargo` inside
-//! it could fake a pass. This module reads commits as raw objects with
-//! `git cat-file` and parses them itself. Configuration cannot change that
-//! output. Replacement objects are off, because a `refs/replace/` ref would
-//! make git answer for one commit with another. The user's and the system's
-//! git configuration are off too.
+//! it could fake a pass. This module reads the changelog at the commit as a
+//! raw object with `git cat-file`. Replacement objects are off, because a
+//! `refs/replace/` ref would make git answer for one commit with another. The
+//! user's and the system's git configuration are off too.
 //!
-//! The approval also names the commit of the `publish` branch that it expects
-//! the release to run from, in a `Release-Workflow` trailer. A change to that
-//! branch after the approval stops the release until someone approves again.
-//! This catches a change made in good faith that the approver did not know
-//! of. A change made to get around the check can remove the check as well.
-//! Only the ruleset on `publish` stops such a change.
+//! The approval names the commit of the `publish` branch the release is to
+//! run from. A change to that branch after the approval stops the release
+//! until someone approves again. This catches a change made in good faith that
+//! the approver did not know of. A change made to get around the check can
+//! remove the check as well. Only the ruleset on `publish` stops such a change.
 //!
-//! An approval expires: its committer time, which the signature covers, must
-//! be recent. Without this, anyone who can push could merge and release an
-//! approved tree that was later abandoned, for example for a bug found after
-//! approving.
+//! An approval expires: its time, which the signature covers, must be recent.
+//! `touchgate approve` starts the release right after signing, and the
+//! approval is checked first, so the limit can be short. Within it, anyone who
+//! can start the workflow can start it again with the same approval. That
+//! releases the same commit again, and publishing skips what the registry has
+//! already.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::changelog::{self, Changelog};
+use crate::version::{Date, Version};
+
 /// The authenticator flag for user presence: the key was touched.
 const USER_PRESENT: u8 = 0x01;
 /// The authenticator flag for user verification: the PIN was entered.
 const USER_VERIFIED: u8 = 0x04;
 
-/// The namespace git signs commits in.
-const NAMESPACE: &str = "git";
+/// The namespace an approval is signed in.
+const NAMESPACE: &str = "touchgate-release";
 
-/// How the subject of an approval starts.
-pub const APPROVAL: &str = "Approve release";
+/// The first line of an approval's message.
+const MESSAGE_HEADER: &str = "touchgate release approval";
 
-/// The trailer of an approval that names the commit of the `publish` branch
-/// the release is to run from.
-pub const WORKFLOW_TRAILER: &str = "Release-Workflow";
+/// The line before the signature in [`SignedApproval::text`].
+const SIGNATURE_BEGIN: &str = "-----BEGIN SSH SIGNATURE-----";
+
+/// The changelog that a release's version is read from, at the root of the
+/// repository.
+const CHANGELOG: &str = "CHANGELOG.md";
 
 /// The principal the one allowed key is listed under. Only this module reads
 /// the allowed-signers file, so the name is arbitrary.
 const PRINCIPAL: &str = "touchgate";
 
-/// How far an approval's committer time may lie ahead of the clock, for a
-/// signing machine whose clock runs a little fast.
+/// How far an approval's time may lie ahead of the clock, for a signing
+/// machine whose clock runs a little fast.
 const CLOCK_SKEW_SECONDS: i64 = 300;
 
-/// Checks that `commit` in the repository at `repo` is a release that `key`
-/// approved at most `max_age_seconds` ago, and returns the approval commit.
-/// `key` is a public key as `ssh-keygen` writes it,
-/// `sk-ssh-ed25519@openssh.com AAAA... comment`. `branch` is the ref the
-/// release must be on, such as `origin/main`. `workflow_commit` is the commit
-/// of the `publish` branch this run's release workflow comes from, which the
-/// approval must name.
-pub fn verify(
+/// What a person approves: the release of `commit` in `repository` as
+/// `version`, by `release.yml` from `workflow_commit` on `publish`.
+#[derive(Debug, PartialEq)]
+pub struct Approval {
+    /// The repository as `owner/name`.
+    pub repository: String,
+    /// The full hash of the commit to release, on the default branch.
+    pub commit: String,
+    pub version: Version,
+    /// The commit of the `publish` branch the release is to run from.
+    pub workflow_commit: String,
+    /// When the approval was signed, in seconds since the Unix epoch.
+    pub time: i64,
+}
+
+impl Approval {
+    /// Returns the message that the key signs, one `name: value` line per
+    /// field after [`MESSAGE_HEADER`].
+    fn message(&self) -> String {
+        format!(
+            "{MESSAGE_HEADER}\nrepository: {}\ncommit: {}\nversion: {}\nworkflow-commit: {}\ntime: {}\n",
+            self.repository, self.commit, self.version, self.workflow_commit, self.time
+        )
+    }
+
+    /// Reads a message as [`Approval::message`] writes it, and nothing else.
+    fn parse_message(message: &str) -> Result<Self, String> {
+        let malformed = |why: &str| format!("the approval is malformed: {why}");
+        let body = message
+            .strip_suffix('\n')
+            .ok_or_else(|| malformed("it does not end in a newline"))?;
+        let mut lines = body.split('\n');
+        if lines.next() != Some(MESSAGE_HEADER) {
+            return Err(malformed(&format!(
+                "it does not start with `{MESSAGE_HEADER}`"
+            )));
+        }
+        let mut field = |name: &str| {
+            lines
+                .next()
+                .and_then(|line| line.strip_prefix(name))
+                .and_then(|line| line.strip_prefix(": "))
+                .ok_or_else(|| malformed(&format!("no `{name}` line where it belongs")))
+        };
+        let repository = field("repository")?.to_owned();
+        let commit = field("commit")?.to_owned();
+        let version = Version::parse(field("version")?)?;
+        let workflow_commit = field("workflow-commit")?.to_owned();
+        let time = field("time")?;
+        let time = time
+            .parse::<i64>()
+            .ok()
+            .filter(|_| !time.starts_with('+'))
+            .ok_or_else(|| malformed(&format!("`{time}` is not a time in seconds")))?;
+        if lines.next().is_some() {
+            return Err(malformed("it has lines after `time`"));
+        }
+        if !is_repository(&repository) {
+            return Err(malformed(&format!("`{repository}` is not owner/name")));
+        }
+        for hash in [&commit, &workflow_commit] {
+            if !is_hash(hash) {
+                return Err(malformed(&format!("`{hash}` is not a full commit hash")));
+            }
+        }
+        Ok(Self {
+            repository,
+            commit,
+            version,
+            workflow_commit,
+            time,
+        })
+    }
+
+    /// Signs the approval with the key at `key`, which asks for its PIN and a
+    /// touch.
+    ///
+    /// This function runs without an SSH agent. ssh-keygen would ask an agent
+    /// that holds the key instead. An agent such as GNOME Keyring's cannot
+    /// ask a security key for its PIN, so it refuses.
+    pub fn sign(self, key: &Path) -> Result<SignedApproval, String> {
+        let message = self.message();
+        let dir = private_temp_dir()?;
+        let payload = dir.join("approval");
+        let signed = std::fs::write(&payload, &message)
+            .map_err(|error| error.to_string())
+            .and_then(|()| {
+                let status = Command::new("ssh-keygen")
+                    .env_remove("SSH_AUTH_SOCK")
+                    // -q drops "Signing file" and "Write signature to", and
+                    // keeps the PIN prompt and "Confirm user presence".
+                    .args(["-q", "-Y", "sign", "-n", NAMESPACE, "-f"])
+                    .arg(key)
+                    .arg(&payload)
+                    .status()
+                    .map_err(|error| format!("ssh-keygen: {error}"))?;
+                if !status.success() {
+                    return Err("ssh-keygen could not sign the approval".to_owned());
+                }
+                std::fs::read_to_string(dir.join("approval.sig")).map_err(|error| error.to_string())
+            });
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(SignedApproval {
+            approval: self,
+            message,
+            armored: signed?.trim_end().to_owned(),
+        })
+    }
+}
+
+/// An approval with the signature that `touchgate approve` made. Parsing one
+/// checks only its form; [`verify`] checks the signature.
+#[derive(Debug)]
+pub struct SignedApproval {
+    pub approval: Approval,
+    /// The exact bytes that were signed.
+    message: String,
+    /// The signature, from `-----BEGIN SSH SIGNATURE-----` to its end line.
+    armored: String,
+}
+
+impl SignedApproval {
+    /// Reads the text that [`SignedApproval::text`] writes.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let split = text
+            .find(&format!("\n{SIGNATURE_BEGIN}\n"))
+            .ok_or("the approval has no SSH signature")?;
+        let (message, armored) = text.split_at(split + 1);
+        Ok(Self {
+            approval: Approval::parse_message(message)?,
+            message: message.to_owned(),
+            armored: armored.trim_end().to_owned(),
+        })
+    }
+
+    /// Returns the message followed by its signature: what `release.yml`
+    /// takes as its `approval` input, and what the GitHub release keeps.
+    pub fn text(&self) -> String {
+        format!("{}{}\n", self.message, self.armored)
+    }
+
+    /// Checks that `key` signed the message with a touch and the PIN, in the
+    /// namespace of approvals.
+    fn check_signature(&self, key: &str) -> Result<(), String> {
+        let (key_type, key_blob) = parse_public_key(key)?;
+        let signature = Signature::parse(&decode_armor(&self.armored)?)?;
+        if signature.public_key != key_blob {
+            return Err("the approval is signed by another key than the one allowed".to_owned());
+        }
+        if signature.namespace != NAMESPACE.as_bytes() {
+            return Err(format!(
+                "the approval is signed in the namespace `{}`, not `{NAMESPACE}`. Approve with \
+                 `touchgate approve`",
+                String::from_utf8_lossy(&signature.namespace)
+            ));
+        }
+        let Some(flags) = signature.flags else {
+            return Err(
+                "the approval is signed with a key that is not a FIDO2 key, so it carries no \
+                 touch or PIN"
+                    .to_owned(),
+            );
+        };
+        if flags & USER_PRESENT == 0 {
+            return Err("the approval was signed without a touch of the key".to_owned());
+        }
+        if flags & USER_VERIFIED == 0 {
+            return Err("the approval was signed without the key's PIN".to_owned());
+        }
+        ssh_keygen_verify(key_type, key, self.message.as_bytes(), &self.armored)
+            .map_err(|error| format!("the signature of the approval is invalid: {error}"))
+    }
+}
+
+/// What a release run expects of its approval.
+pub struct Expected<'a> {
+    /// The public key that approves releases, as `ssh-keygen` writes it:
+    /// `sk-ssh-ed25519@openssh.com AAAA... comment`.
+    pub key: &'a str,
+    /// The repository of the run, as `owner/name`.
+    pub repository: &'a str,
+    /// The ref the release must be on, such as `origin/main`.
+    pub branch: &'a str,
+    /// The commit of the `publish` branch this run's release workflow comes
+    /// from.
+    pub workflow_commit: &'a str,
+    /// How long an approval lasts.
+    pub max_age_seconds: i64,
+}
+
+/// Checks that `signed` approves a release that this run, as `expected`
+/// describes it, may publish, with the repository at `repo`.
+pub fn verify(repo: &Path, signed: &SignedApproval, expected: &Expected) -> Result<(), String> {
+    signed.check_signature(expected.key)?;
+
+    // Only now are the fields known to be the signer's.
+    let approval = &signed.approval;
+    if approval.repository != expected.repository {
+        return Err(format!(
+            "the approval is for {}, not for {}",
+            approval.repository, expected.repository
+        ));
+    }
+    if approval.workflow_commit != expected.workflow_commit {
+        return Err(format!(
+            "the approval expects the release to run from publish at {}, but this run comes \
+             from {}. The publish branch changed after the approval: check the change, then \
+             approve again",
+            approval.workflow_commit, expected.workflow_commit
+        ));
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_secs() as i64;
+    let age = now - approval.time;
+    if age > expected.max_age_seconds {
+        return Err(format!(
+            "the approval is {} old, older than the {} an approval lasts. Approve again",
+            describe(age),
+            describe(expected.max_age_seconds)
+        ));
+    }
+    if age < -CLOCK_SKEW_SECONDS {
+        return Err(format!(
+            "the approval is dated {} seconds in the future",
+            -age
+        ));
+    }
+    let (version, date) = approvable_release(repo, &approval.commit, expected.branch)?;
+    if version != approval.version {
+        return Err(format!(
+            "the approval is for {}, but {} releases {version}",
+            approval.version, approval.commit
+        ));
+    }
+    check_release_date(&version, date, approval.time)
+}
+
+/// Checks that the changelog dates the release of `version` `date`, the day
+/// of the approval at `time` or the day before, in UTC. The day before
+/// admits a release prepared late in the evening and approved after midnight.
+pub fn check_release_date(version: &Version, date: Date, time: i64) -> Result<(), String> {
+    let day = Date::of_unix_time(time);
+    if date == day || date == Date::of_unix_time(time - 86_400) {
+        return Ok(());
+    }
+    let relation = if date > day { "after" } else { "before" };
+    Err(format!(
+        "{CHANGELOG} dates {version} {date}, {relation} the approval on {day}. Run \
+         `touchgate prepare {version}` to date it anew, push that, and approve again"
+    ))
+}
+
+/// Returns the version that `commit` releases and its date, read from the
+/// changelog at the root of the repository at `repo`. Fails if `commit` is
+/// not on `branch`, or if its changelog has entries under `## Unreleased`,
+/// which the release would ship without naming them. Runs nothing from
+/// `commit`.
+pub fn approvable_release(
     repo: &Path,
     commit: &str,
-    key: &str,
     branch: &str,
-    workflow_commit: &str,
-    max_age_seconds: i64,
-) -> Result<String, String> {
-    let (key_type, key_blob) = parse_public_key(key)?;
-    let hash_len = commit.len();
+) -> Result<(Version, Date), String> {
     if !is_hash(commit) {
         return Err(format!("`{commit}` is not a full commit hash"));
     }
-
     let ancestor = git(repo)
         .args(["merge-base", "--is-ancestor", commit, branch])
         .status()
@@ -93,114 +347,33 @@ pub fn verify(
     if !ancestor.success() {
         return Err(format!("{commit} is not on {branch}"));
     }
-
-    let merge = RawCommit::read(repo, commit)?;
-    let [_, approval] = &merge.parents[..] else {
+    let output = git(repo)
+        .args(["cat-file", "blob", &format!("{commit}:{CHANGELOG}")])
+        .output()
+        .map_err(|error| format!("git: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("{commit} has no {CHANGELOG} at the root"));
+    }
+    let text = crate::utf8(output.stdout, CHANGELOG)?;
+    if !changelog::unreleased_entries(&text).is_empty() {
         return Err(format!(
-            "{commit} is not a merge of two parents, so it has no approval as its second parent"
-        ));
-    };
-    let approval = approval.clone();
-    let approved = RawCommit::read(repo, &approval)?;
-    if merge.tree != approved.tree {
-        return Err(format!(
-            "{commit} has another tree than the approval {approval}, so the merge brought in \
-             changes that were not approved. Bring the release branch up to date and approve again"
+            "{commit} has entries under `## Unreleased` in {CHANGELOG}, which this release would \
+             ship unnamed. Prepare the release, or approve the commit that prepared it"
         ));
     }
-    if !approved.subject.starts_with(APPROVAL) {
-        return Err(format!(
-            "the second parent {approval} is `{}`, not an approval starting with `Approve release`",
-            approved.subject
-        ));
-    }
-
-    let header = if hash_len == 64 {
-        "gpgsig-sha256"
-    } else {
-        "gpgsig"
-    };
-    let (payload, armored) = split_signature(&approved.raw, header)
-        .ok_or_else(|| format!("the approval {approval} is not signed"))?;
-
-    let signature = Signature::parse(&decode_armor(&armored)?)?;
-    if signature.public_key != key_blob {
-        return Err(format!(
-            "the approval {approval} is signed by another key than the one allowed"
-        ));
-    }
-    if signature.namespace != NAMESPACE.as_bytes() {
-        return Err(format!(
-            "the approval {approval} is not signed in the `git` namespace"
-        ));
-    }
-    let Some(flags) = signature.flags else {
-        return Err(format!(
-            "the approval {approval} is signed with a key that is not a FIDO2 key, so it carries no touch or PIN"
-        ));
-    };
-    if flags & USER_PRESENT == 0 {
-        return Err(format!(
-            "the approval {approval} was signed without a touch of the key"
-        ));
-    }
-    if flags & USER_VERIFIED == 0 {
-        return Err(format!(
-            "the approval {approval} was signed without the key's PIN"
-        ));
-    }
-
-    ssh_keygen_verify(key_type, key, &payload, &armored)
-        .map_err(|error| format!("the signature of the approval {approval} is invalid: {error}"))?;
-
-    // Only now are the trailer and the committer time known to be the
-    // signer's.
-    let prefix = format!("{WORKFLOW_TRAILER}: ");
-    let named: Vec<&str> = approved
-        .message
-        .lines()
-        .filter_map(|line| line.strip_prefix(&prefix))
-        .collect();
-    match named[..] {
-        [named] if named == workflow_commit => {}
-        [named] => {
-            return Err(format!(
-                "the approval {approval} expects the release to run from publish at {named}, \
-                 but this run comes from {workflow_commit}. The publish branch changed after the \
-                 approval: check the change, then approve again"
-            ));
-        }
-        _ => {
-            return Err(format!(
-                "the approval {approval} has no single `{WORKFLOW_TRAILER}` trailer naming the \
-                 publish commit. Approve with `touchgate approve`"
-            ));
-        }
-    }
-
-    // Only now is the committer time known to be the signer's.
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| error.to_string())?
-        .as_secs() as i64;
-    let age = now - approved.committer_time;
-    if age > max_age_seconds {
-        return Err(format!(
-            "the approval {approval} is {} old, older than the {} an approval lasts. Approve again",
-            describe(age),
-            describe(max_age_seconds)
-        ));
-    }
-    if age < -CLOCK_SKEW_SECONDS {
-        return Err(format!(
-            "the approval {approval} is dated {} seconds in the future",
-            -age
-        ));
-    }
-    Ok(approval)
+    let changelog = Changelog::parse(&text).map_err(|errors| {
+        format!(
+            "{CHANGELOG} at {commit} is malformed: {}",
+            errors.join("; ")
+        )
+    })?;
+    changelog
+        .newest_release()
+        .map(|(version, date)| (version.clone(), date))
+        .ok_or_else(|| format!("{CHANGELOG} at {commit} has no released section"))
 }
 
-/// Reads how long an approval lasts, such as `30m`, `1h` or `7d`, in seconds.
+/// Reads how long an approval lasts, such as `15m`, `1h` or `7d`, in seconds.
 /// From a minute to 30 days.
 pub fn parse_age(text: &str) -> Result<i64, String> {
     let invalid = || format!("`{text}` is not a duration from 1m to 30d, such as 30m, 1h or 7d");
@@ -236,30 +409,23 @@ fn describe(seconds: i64) -> String {
     }
 }
 
-/// Returns the approval that the merge `commit` brings in, if the subject of
-/// its second parent names one. Checks nothing else. This function only decides
-/// whether to start a release, and [`verify`] decides whether it publishes.
-pub fn merged_approval(repo: &Path, commit: &str) -> Result<Option<String>, String> {
-    if !is_hash(commit) {
-        return Err(format!("`{commit}` is not a full commit hash"));
-    }
-    let merge = RawCommit::read(repo, commit)?;
-    let [_, approval] = &merge.parents[..] else {
-        return Ok(None);
-    };
-    let approved = RawCommit::read(repo, approval)?;
-    Ok(approved
-        .subject
-        .starts_with(APPROVAL)
-        .then(|| approval.clone()))
-}
-
 /// Returns whether `text` is a full SHA-1 or SHA-256 commit hash.
 pub fn is_hash(text: &str) -> bool {
     (text.len() == 40 || text.len() == 64)
         && text
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Returns whether `text` reads as a GitHub repository, `owner/name`.
+fn is_repository(text: &str) -> bool {
+    let allowed = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    };
+    matches!(text.split_once('/'), Some((owner, name)) if allowed(owner) && allowed(name))
 }
 
 /// Returns a git command, with the settings that could make git answer for
@@ -287,71 +453,6 @@ fn git(repo: &Path) -> Command {
     command
 }
 
-/// What touchgate reads of a commit object.
-struct RawCommit {
-    /// The object as `git cat-file` prints it, which is what a signature
-    /// covers once its own header is taken out.
-    raw: Vec<u8>,
-    tree: String,
-    parents: Vec<String>,
-    /// Seconds since the Unix epoch.
-    committer_time: i64,
-    /// The first line of the message.
-    subject: String,
-    message: String,
-}
-
-impl RawCommit {
-    fn read(repo: &Path, hash: &str) -> Result<Self, String> {
-        let output = git(repo)
-            .args(["cat-file", "commit", hash])
-            .output()
-            .map_err(|error| format!("git: {error}"))?;
-        if !output.status.success() {
-            return Err(format!("git cannot read the commit {hash}"));
-        }
-        let raw = output.stdout;
-        let malformed = || format!("the commit {hash} is malformed");
-        let text =
-            std::str::from_utf8(&raw).map_err(|_| format!("the commit {hash} is not UTF-8"))?;
-        let (header, message) = text.split_once("\n\n").ok_or_else(malformed)?;
-        let mut tree = None;
-        let mut parents = Vec::new();
-        let mut committer_time = None;
-        for line in header.lines() {
-            if let Some(value) = line.strip_prefix("tree ") {
-                if tree.replace(value.to_owned()).is_some() || !is_hash(value) {
-                    return Err(malformed());
-                }
-            } else if let Some(value) = line.strip_prefix("parent ") {
-                if !is_hash(value) {
-                    return Err(malformed());
-                }
-                parents.push(value.to_owned());
-            } else if let Some(value) = line.strip_prefix("committer ") {
-                // `Name <email> 1790000000 +0000`: the time is the second
-                // field from the end.
-                let time = value
-                    .rsplit(' ')
-                    .nth(1)
-                    .and_then(|time| time.parse::<i64>().ok())
-                    .ok_or_else(malformed)?;
-                if committer_time.replace(time).is_some() {
-                    return Err(malformed());
-                }
-            }
-        }
-        Ok(Self {
-            tree: tree.ok_or_else(malformed)?,
-            parents,
-            committer_time: committer_time.ok_or_else(malformed)?,
-            subject: message.lines().next().unwrap_or_default().to_owned(),
-            message: message.to_owned(),
-            raw,
-        })
-    }
-}
-
 /// Runs `ssh-keygen -Y verify` with `key` as the one allowed signer.
 fn ssh_keygen_verify(
     key_type: &str,
@@ -359,7 +460,7 @@ fn ssh_keygen_verify(
     payload: &[u8],
     armored: &str,
 ) -> Result<(), String> {
-    let dir = fresh_dir()?;
+    let dir = private_temp_dir()?;
     let allowed = dir.join("allowed_signers");
     let signature = dir.join("signature");
     let key_base64 = key.split_whitespace().nth(1).unwrap_or_default();
@@ -398,120 +499,9 @@ fn ssh_keygen_verify(
     result
 }
 
-/// Commits an empty, signed approval with `message` on top of `head`, the tip
-/// of `branch`, and moves the branch to it.
-///
-/// This function runs `ssh-keygen -Y sign` itself instead of `git commit -S`.
-/// git hides the error output of ssh-keygen, and ssh-keygen asks there for a
-/// touch after the PIN.
-///
-/// It also signs without an SSH agent. ssh-keygen would ask an agent that
-/// holds the key instead. An agent such as GNOME Keyring's cannot ask a
-/// security key for its PIN, so it refuses.
-pub fn sign_approval(
-    key: &Path,
-    branch: &str,
-    head: &str,
-    message: &str,
-) -> Result<String, String> {
-    if !is_hash(head) {
-        return Err(format!("`{head}` is not a full commit hash"));
-    }
-    let local = |args: &[&str]| -> Result<String, String> {
-        let output = Command::new("git")
-            .args(args)
-            .output()
-            .map_err(|error| format!("git: {error}"))?;
-        if output.status.success() {
-            Ok(crate::utf8(output.stdout, "git")?.trim_end().to_owned())
-        } else {
-            Err(format!(
-                "git {}: {}",
-                args.join(" "),
-                crate::utf8(output.stderr, "git")?.trim()
-            ))
-        }
-    };
-    let tree = local(&["rev-parse", "--verify", &format!("{head}^{{tree}}")])?;
-    let author = local(&["var", "GIT_AUTHOR_IDENT"])?;
-    let committer = local(&["var", "GIT_COMMITTER_IDENT"])?;
-    let unsigned =
-        format!("tree {tree}\nparent {head}\nauthor {author}\ncommitter {committer}\n\n{message}");
-
-    let dir = fresh_dir()?;
-    let payload = dir.join("commit");
-    let signed = std::fs::write(&payload, &unsigned)
-        .map_err(|error| error.to_string())
-        .and_then(|()| {
-            let status = Command::new("ssh-keygen")
-                .env_remove("SSH_AUTH_SOCK")
-                // -q drops "Signing file" and "Write signature to", and keeps
-                // the PIN prompt and "Confirm user presence".
-                .args(["-q", "-Y", "sign", "-n", NAMESPACE, "-f"])
-                .arg(key)
-                .arg(&payload)
-                .status()
-                .map_err(|error| format!("ssh-keygen: {error}"))?;
-            if !status.success() {
-                return Err("ssh-keygen could not sign the approval".to_owned());
-            }
-            std::fs::read_to_string(dir.join("commit.sig")).map_err(|error| error.to_string())
-        });
-    let _ = std::fs::remove_dir_all(&dir);
-    let signature = signed?;
-
-    let header = if head.len() == 64 {
-        "gpgsig-sha256"
-    } else {
-        "gpgsig"
-    };
-    let signature = signature.trim_end().replace('\n', "\n ");
-    let (headers, body) = unsigned.split_once("\n\n").expect("written above");
-    let commit = format!("{headers}\n{header} {signature}\n\n{body}");
-
-    let mut child = Command::new("git")
-        .args(["hash-object", "-t", "commit", "-w", "--stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("git: {error}"))?;
-    child
-        .stdin
-        .take()
-        .expect("piped")
-        .write_all(commit.as_bytes())
-        .map_err(|error| error.to_string())?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Err(format!(
-            "git hash-object: {}",
-            crate::utf8(output.stderr, "git")?.trim()
-        ));
-    }
-    let approval = crate::utf8(output.stdout, "git")?.trim_end().to_owned();
-    // Moves the branch only if it is still at `head`.
-    local(&[
-        "update-ref",
-        "-m",
-        "touchgate approve",
-        &format!("refs/heads/{branch}"),
-        &approval,
-        head,
-    ])?;
-    println!(
-        "[{branch} {}] {}",
-        &approval[..7],
-        message.lines().next().unwrap_or_default()
-    );
-    Ok(approval)
-}
-
 /// Creates a directory that no one else made. Creating it fails if the name is
 /// taken, so nothing placed there beforehand is read as the allowed signers.
-fn fresh_dir() -> Result<PathBuf, String> {
+pub fn private_temp_dir() -> Result<PathBuf, String> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
@@ -519,38 +509,6 @@ fn fresh_dir() -> Result<PathBuf, String> {
     let dir = std::env::temp_dir().join(format!("touchgate-{}-{nanos}", std::process::id()));
     std::fs::create_dir(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
     Ok(dir)
-}
-
-/// Splits a raw commit into what was signed and the armored signature. The
-/// signed payload is the commit without the signature header and its
-/// continuation lines, which start with a space.
-fn split_signature(raw: &[u8], header: &str) -> Option<(Vec<u8>, String)> {
-    let prefix = format!("{header} ");
-    let mut payload = Vec::with_capacity(raw.len());
-    let mut armored: Option<String> = None;
-    let mut in_signature = false;
-    let mut in_header = true;
-    for line in raw.split_inclusive(|&b| b == b'\n') {
-        if in_header {
-            if line == b"\n" {
-                in_header = false;
-            } else if in_signature && line.starts_with(b" ") {
-                let text = std::str::from_utf8(&line[1..]).ok()?;
-                armored.as_mut()?.push_str(text);
-                continue;
-            } else if let Some(first) = line.strip_prefix(prefix.as_bytes()) {
-                if armored.is_some() {
-                    return None;
-                }
-                armored = Some(std::str::from_utf8(first).ok()?.to_owned());
-                in_signature = true;
-                continue;
-            }
-            in_signature = false;
-        }
-        payload.extend_from_slice(line);
-    }
-    Some((payload, armored?.trim_end().to_owned()))
 }
 
 /// Returns the bytes inside `-----BEGIN SSH SIGNATURE-----`.
@@ -692,7 +650,6 @@ fn base64(text: &str) -> Option<Vec<u8>> {
     }
     Some(out)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,19 +710,81 @@ mod tests {
         }
     }
 
+    fn approval() -> Approval {
+        Approval {
+            repository: "borink-org/touchgate".to_owned(),
+            commit: "a".repeat(40),
+            version: Version::parse("0.4.0").unwrap(),
+            workflow_commit: "b".repeat(40),
+            time: 1_793_000_000,
+        }
+    }
+
+    const SIGNATURE: &str = "-----BEGIN SSH SIGNATURE-----\nU1NI\n-----END SSH SIGNATURE-----";
+
     #[test]
-    fn splits_the_signature_from_the_payload() {
-        let raw = b"tree t\nparent p\nauthor a\ncommitter c\ngpgsig -----BEGIN SSH SIGNATURE-----\n U1NI\n -----END SSH SIGNATURE-----\n\nApprove release 0.1.0.\n";
-        let (payload, armored) = split_signature(raw, "gpgsig").unwrap();
-        assert_eq!(
-            payload,
-            b"tree t\nparent p\nauthor a\ncommitter c\n\nApprove release 0.1.0.\n"
+    fn wants_the_release_dated_the_day_of_the_approval() {
+        let version = Version::parse("0.4.0").unwrap();
+        let date = Date::parse("2026-11-01").unwrap();
+        // 2026-11-01 at 00:00 and at 23:59 UTC, and 2026-11-02 at 00:30.
+        let (start, end, after_midnight) = (1_793_491_200, 1_793_577_599, 1_793_579_400);
+        for time in [start, end, after_midnight] {
+            assert_eq!(check_release_date(&version, date, time), Ok(()), "{time}");
+        }
+        let late = check_release_date(&version, date, start + 2 * 86_400).unwrap_err();
+        assert!(
+            late.contains("2026-11-01, before the approval on 2026-11-03"),
+            "{late}"
         );
-        assert_eq!(
-            armored,
-            "-----BEGIN SSH SIGNATURE-----\nU1NI\n-----END SSH SIGNATURE-----"
+        let early = check_release_date(&version, date, start - 1).unwrap_err();
+        assert!(
+            early.contains("after the approval on 2026-10-31"),
+            "{early}"
         );
+    }
+
+    #[test]
+    fn reads_the_text_it_writes() {
+        let message = approval().message();
+        assert_eq!(
+            message,
+            format!(
+                "touchgate release approval\nrepository: borink-org/touchgate\ncommit: {}\n\
+                 version: 0.4.0\nworkflow-commit: {}\ntime: 1793000000\n",
+                "a".repeat(40),
+                "b".repeat(40)
+            )
+        );
+        let text = format!("{message}{SIGNATURE}\n");
+        let signed = SignedApproval::parse(&text).unwrap();
+        assert_eq!(signed.approval, approval());
+        assert_eq!(signed.message, message);
+        assert_eq!(signed.armored, SIGNATURE);
+        assert_eq!(signed.text(), text);
         assert_eq!(base64("U1NIU0lH").unwrap(), b"SSHSIG");
         assert_eq!(base64("YQ==").unwrap(), b"a");
+    }
+
+    #[test]
+    fn reads_nothing_but_the_message_it_writes() {
+        let message = approval().message();
+        for bad in [
+            message.replace("touchgate release approval", "Approve release 0.4.0."),
+            message.replace("repository: ", "repository:"),
+            message.replace("borink-org/touchgate", "borink-org"),
+            message.replace(&"a".repeat(40), "aaaa"),
+            message.replace("version: 0.4.0", "version: 4"),
+            message.replace("1793000000", "+1793000000"),
+            message.replace("time: 1793000000\n", "time: 1793000000\nextra: 1\n"),
+            message.replace("time: 1793000000\n", "time: 1793000000"),
+            // The fields in another order.
+            message.replace(
+                &format!("commit: {}\nversion: 0.4.0\n", "a".repeat(40)),
+                &format!("version: 0.4.0\ncommit: {}\n", "a".repeat(40)),
+            ),
+        ] {
+            assert!(Approval::parse_message(&bad).is_err(), "{bad}");
+        }
+        assert!(SignedApproval::parse(&message).is_err());
     }
 }

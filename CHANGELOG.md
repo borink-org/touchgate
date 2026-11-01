@@ -4,7 +4,19 @@
 
 ### Changed
 
-- `touchgate prepare` prepares a version again if the changelog dates it but no tag names it. It moves any entries of `## Unreleased` into that version's section, and opens the release pull request again. After a release that failed before it published, run the release steps again with the same version.
+- `touchgate approve` approves a commit on the default branch, its tip unless you name another, and starts `release.yml` itself. It signs a message that names the repository, the commit, its version, the commit of `publish` and the time, in the SSH namespace `touchgate-release`. A release needs no release branch, approval commit or merge, so CI runs once for it.
+- `release.yml` takes the input `approval` instead of `commit`. `touchgate verify` reads the commit from the approval, and sets it as the step output `commit` for the jobs that check it out. Copy the examples again, and update `publish`.
+- An approval lasts 15 minutes unless `--max-age` says otherwise, instead of an hour.
+- `touchgate approve` and `touchgate verify` refuse a release that the changelog dates another day than the approval or the day before, in UTC.
+- `touchgate github-release` in a release run attaches the run's approval to the GitHub release, as `touchgate-approval.txt`.
+- The pull request of `touchgate prepare --pull-request` may be merged in any way, and is titled `Prepare the 0.4.0 release.`.
+- `touchgate check-entry` passes for a change that prepares a release, whatever its branch is called.
+- `touchgate prepare` prepares a version again if the changelog dates it but no tag names it. It moves any entries of `## Unreleased` into that version's section, and dates the section anew. After a release that failed before it published, or one whose date has passed, prepare the same version again and approve again.
+
+### Removed
+
+- `touchgate start`, and the `start` job of `examples/touchgate.yml`.
+- Option `touchgate approve --no-push`. Option `--no-start` prints the approval instead of starting the release.
 
 ## 0.1.0 - 2026-11-01
 

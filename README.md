@@ -6,13 +6,23 @@ touchgate releases a Cargo workspace to crates.io, or a Python package to PyPI, 
 
 ## Releasing
 
-1. Run the `touchgate` workflow with a version. It dates `## Unreleased`, sets the version and opens a pull request.
-2. When the checks of the pull request pass, check out its branch and run `touchgate approve`. The key asks for its PIN and a touch. touchgate then signs an empty commit `Approve release 0.4.0.` and pushes it. Your git signing settings do not change.
-3. Merge the pull request with a merge commit within the hour.
+1. Run `touchgate prepare 0.4.0`. It dates `## Unreleased` and sets the version. Commit that and push it to the default branch. If the default branch takes changes only through pull requests, run the `touchgate` workflow with the version instead. It opens a pull request with the same change, which you merge in any way.
+2. Run `touchgate approve`. It shows the commits since the last release, and the key asks for its PIN and a touch. touchgate then signs an approval of the tip of the default branch and starts `release.yml` with it. To approve another commit on the default branch, pass it: `touchgate approve <commit>`.
 
-When every check on the merge has passed, `release.yml` publishes the release to crates.io or PyPI. It then makes the tag and the GitHub release.
+Prepare and approve on the same day, or the next: the release must be dated the day of the approval or the day before, in UTC. For a release prepared earlier, run `touchgate prepare 0.4.0` again, which dates it anew, and push that.
 
-If the release fails, fix the cause on the default branch and copy any change to `release.yml` to `publish`. Then run the same three steps with the same version. touchgate opens the pull request again, and moves anything merged under `## Unreleased` since into that version's section. A version with a tag has published already, and needs a newer version instead. A failure in a step of a release run that has not changed can also be run again from GitHub Actions.
+You need not wait for CI before you approve. `release.yml` checks the approval first, then waits until every check on the commit has passed. It publishes the release to crates.io or PyPI, and then makes the tag and the GitHub release, with the approval attached as `touchgate-approval.txt`.
+
+An approval adds no commit, so CI runs once for a release: on the commit that prepares it. Fold the prepare into your last change, and it adds no CI run at all.
+
+To sign on one machine and start the release from another, run `touchgate approve --no-start`, which prints the approval instead of starting the release, and start the release with it from the other machine:
+
+```nu
+touchgate approve --no-start | save approval.txt
+gh workflow run release.yml --ref publish -F approval=@approval.txt
+```
+
+If a release fails, re-run its failed jobs from GitHub Actions. Re-running every job checks the approval again, so after 15 minutes you approve again. If the cause needs a fix, fix it on the default branch and copy any change to `release.yml` to `publish`. Then run both steps again with the same version. `touchgate prepare` moves anything added under `## Unreleased` since into that version's section, and `touchgate approve` refuses a commit with entries left there, so you may skip the prepare if nothing was added. A version with a tag has published already, and needs a newer version instead.
 
 ## Setting up a repository
 
@@ -23,7 +33,9 @@ If the release fails, fix the cause on the default branch and copy any change to
    cargo install --locked --git https://github.com/borink-org/touchgate
    ```
 
-2. Copy [`examples/touchgate.yml`](examples/touchgate.yml) to `.github/workflows/touchgate.yml` on your default branch. It prepares releases, checks the changelog, and starts `release.yml` when a merge brings in an approval.
+   `touchgate approve` also needs `gh`, logged in to an account that can start workflows in the repository.
+
+2. Copy [`examples/touchgate.yml`](examples/touchgate.yml) to `.github/workflows/touchgate.yml` on your default branch. It checks the changelog, and prepares a release through a pull request when you start it with a version.
 3. Copy [`examples/crates-release.yml`](examples/crates-release.yml) to `.github/workflows/release.yml`. For a Python package, copy [`examples/pypi-release.yml`](examples/pypi-release.yml) instead. Set `TOUCHGATE_KEY` in it to the contents of your `.pub` file.
 4. In both files, replace the commit in `borink-org/touchgate/install@<commit>` with the commit of a touchgate release. The release's tag on GitHub names that commit.
 5. Commit both files to the default branch, and copy `release.yml` to a `publish` branch.
@@ -39,19 +51,24 @@ Your everyday account has Maintain on the repository, not Admin. A separate admi
 - A `release` environment that admits only the `publish` branch.
 - A trusted publisher on crates.io or PyPI for `release.yml` in the `release` environment. Delete every API token for the package.
 - Immutable releases.
-- GitHub Actions allowed to create pull requests.
+- GitHub Actions allowed to create pull requests, if you prepare releases with the `touchgate` workflow.
 - A `no-changelog` label, for pull requests that need no changelog entry.
 
 ## What the release checks
 
-`touchgate verify` checks the merge commit before anything else runs. The second parent of the merge must be the approval, and the approval must meet these conditions:
+`touchgate verify` checks the approval before anything else runs. The approval is a short message that names the repository, the commit to release, its version, the commit of `publish` that the release is to run from, and the time it was signed. It must meet these conditions:
 
-- It has the same tree as the merge.
-- It is at most an hour old.
-- It is signed by the key in `TOUCHGATE_KEY`, with flags that show a touch and the PIN. git and `ssh-keygen` accept a FIDO2 signature without these flags, so touchgate reads the flags itself.
+- It is signed by the key in `TOUCHGATE_KEY`, with flags that show a touch and the PIN. `ssh-keygen` accepts a FIDO2 signature without these flags, so touchgate reads the flags itself.
+- It is signed in the namespace `touchgate-release`. A signature covers its namespace, so a git commit signature made with the same key cannot pass as an approval.
+- It names the repository of the run.
+- It is at most 15 minutes old.
 - It names the commit of `publish` that the release runs from. A change to `publish` after you approve stops the release.
+- Its commit is on the default branch, and its `CHANGELOG.md` has no entries under `## Unreleased`. The newest release there is the version that the approval names.
+- That release is dated the day of the approval, or the day before, in UTC. `touchgate prepare` writes dates in UTC. The day before admits a release prepared in the evening and approved after midnight.
 
-touchgate runs no code from the commit that it checks.
+touchgate runs no code from the commit that it checks. It reads `CHANGELOG.md` at the root of the repository with git.
+
+Within its 15 minutes, anyone who can start the workflow can start it again with the same approval. That releases the same commit again, and publishing skips what the registry has already.
 
 ## Installing touchgate in a workflow
 
@@ -67,7 +84,7 @@ touchgate reads and sets `project.version` in `pyproject.toml`, and updates `uv.
 
 - `touchgate verify` checks the approval.
 - `touchgate check --build` checks the version against the changelog. It also fails if `uv build` would download `uv_build` from PyPI instead of using the copy in uv. uv downloads it when the range in `build-system.requires` does not include the running uv. The example pins uv with `UV_VERSION`, so the backend is pinned too. When you move `UV_VERSION` past the range, widen the range. A package with another backend, such as maturin, passes, because uv always downloads that backend.
-- `touchgate wait-for-checks` waits for every check on the merge to pass.
+- `touchgate wait-for-checks` waits for every check on the release commit to pass.
 - `touchgate publish dist` checks that `dist` holds only the wheels and sdist of this version. It signs a PEP 740 attestation for each file with `pypi-attestations`, and uploads the files with `uv publish` through Trusted Publishing. It skips files that PyPI has already. It runs only in a GitHub Actions job with `id-token: write`.
 - `touchgate github-release dist/*` makes the tag and the GitHub release, with the built files attached.
 

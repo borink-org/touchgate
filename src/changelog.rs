@@ -193,18 +193,17 @@ impl<'a> Changelog<'a> {
     /// Returns the text with the entries of `## Unreleased` moved into the
     /// section of `version`, the newest release, which is dated `date`
     /// instead. An entry under a `###` heading goes under the same heading
-    /// there. Returns `None` if there is no `## Unreleased`.
+    /// there. Without `## Unreleased`, only the date changes. Returns `None`
+    /// if nothing would change.
     pub fn release_again(&self, version: &Version, date: Date) -> Result<Option<String>, String> {
-        let Some(unreleased) = self
+        let unreleased = self
             .sections
             .first()
-            .filter(|section| section.heading == Heading::Unreleased)
-        else {
-            return Ok(None);
-        };
+            .filter(|section| section.heading == Heading::Unreleased);
+        let index = usize::from(unreleased.is_some());
         let section = self
             .sections
-            .get(1)
+            .get(index)
             .filter(|section| {
                 matches!(&section.heading, Heading::Release { version: v, .. } if v == version)
             })
@@ -216,11 +215,27 @@ impl<'a> Changelog<'a> {
                     date: older_date,
                 },
             ..
-        }) = self.sections.get(2)
+        }) = self.sections.get(index + 1)
             && date < *older_date
         {
             return Err(format!("{date} is before {older}, released {older_date}"));
         }
+        let heading = format!("## {version} - {date}");
+        let Some(unreleased) = unreleased else {
+            if self.lines[section.line] == heading {
+                return Ok(None);
+            }
+            let mut text = String::new();
+            for (index, line) in self.lines.iter().enumerate() {
+                text.push_str(if index == section.line {
+                    &heading
+                } else {
+                    line
+                });
+                text.push('\n');
+            }
+            return Ok(Some(text));
+        };
         let mut parts = subsections(&self.lines[section.line + 1..section.end]);
         for (title, lines) in subsections(&self.lines[unreleased.line + 1..unreleased.end]) {
             match parts.iter_mut().find(|(existing, _)| *existing == title) {
@@ -233,7 +248,8 @@ impl<'a> Changelog<'a> {
             text.push_str(line);
             text.push('\n');
         }
-        text.push_str(&format!("## {version} - {date}\n"));
+        text.push_str(&heading);
+        text.push('\n');
         for (title, lines) in parts.iter().filter(|(_, lines)| !lines.is_empty()) {
             if let Some(title) = title {
                 text.push_str(&format!("\n### {title}\n"));
@@ -424,6 +440,13 @@ mod tests {
         assert!(unreleased_entries(&again).is_empty());
         let released = Changelog::parse(&again).unwrap();
         assert_eq!(released.release_again(&version, date).unwrap(), None);
+        // With nothing to move, a later date only dates the section anew.
+        let later = Date::parse("2026-10-06").unwrap();
+        let redated = released.release_again(&version, later).unwrap().unwrap();
+        assert_eq!(
+            redated,
+            again.replace("## 0.0.2 - 2026-10-04", "## 0.0.2 - 2026-10-06")
+        );
         assert!(
             Changelog::parse(VALID)
                 .unwrap()
