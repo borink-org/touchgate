@@ -11,6 +11,38 @@ use crate::project::Registry;
 use crate::version::Version;
 
 /// Returns the branch a prepared release is proposed from.
+/// Whether a release pull request prepares a new version, or the version that
+/// the changelog dates already, for a release that has not published yet.
+#[derive(Clone, Copy)]
+pub enum Preparation {
+    /// The changelog and the version files change to the new version.
+    New,
+    /// Nothing changes, and the branch gets an empty commit, so that a new
+    /// approval can go on top of it.
+    Again,
+}
+
+impl Preparation {
+    /// Returns the message of the commit that prepares the release.
+    fn commit_message(self, version: &Version) -> String {
+        match self {
+            Self::New => format!("Prepare the {version} release."),
+            Self::Again => format!("Prepare the {version} release again."),
+        }
+    }
+}
+
+/// Returns the tag of the release of `version`.
+fn release_tag(version: &Version) -> String {
+    format!("v{version}")
+}
+
+/// Returns whether the tag of the release of `version` exists, which
+/// [`release`] makes only after the release has published.
+pub fn is_released(version: &Version) -> Result<bool, String> {
+    Ok(tagged_commit(&release_tag(version))?.is_some())
+}
+
 fn release_branch(version: &Version) -> String {
     format!("release/{version}")
 }
@@ -52,7 +84,7 @@ impl GitHubRelease {
     /// Returns the release of `version`. Its notes link to `changelog`, the
     /// path of the changelog in the repository, as it reads at the tag.
     fn of(version: &Version, changelog: &str) -> Result<Self, String> {
-        let tag = format!("v{version}");
+        let tag = release_tag(version);
         let url = gh(&["repo", "view", "--json", "url", "--jq", ".url"])?;
         let name = changelog.rsplit('/').next().unwrap_or(changelog);
         let notes = format!("See [{name}]({}/blob/{tag}/{changelog}).", url.trim_end());
@@ -82,7 +114,12 @@ impl GitHubRelease {
 /// request for it, or updates the one that is open. `changelog` is the
 /// changelog's path in the repository, and `registry` where the release
 /// publishes to.
-pub fn pull_request(version: &Version, changelog: &str, registry: Registry) -> Result<(), String> {
+pub fn pull_request(
+    version: &Version,
+    preparation: Preparation,
+    changelog: &str,
+    registry: Registry,
+) -> Result<(), String> {
     let release = GitHubRelease::of(version, changelog)?;
     let branch = release_branch(version);
     git(&["switch", "--create", &branch])?;
@@ -93,9 +130,10 @@ pub fn pull_request(version: &Version, changelog: &str, registry: Registry) -> R
         "user.email=41898282+github-actions[bot]@users.noreply.github.com",
         "commit",
         "--all",
+        "--allow-empty",
         "--no-verify",
         "--message",
-        &format!("Prepare the {version} release."),
+        &preparation.commit_message(version),
     ])?;
     git(&[
         "push",

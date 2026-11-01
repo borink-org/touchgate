@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `touchgate prepare` opens the release pull request again, with an empty commit, for a version that the changelog dates but no tag names. After a release that failed before it published, run the release steps again with the same version.
+
 ## 0.1.0 - 2026-11-01
 
 ### Added
