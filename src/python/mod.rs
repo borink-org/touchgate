@@ -25,18 +25,22 @@ const IN_GITHUB_ACTIONS: &str = "GITHUB_ACTIONS";
 /// for the job's OIDC token.
 const OIDC_REQUEST_URL: &str = "ACTIONS_ID_TOKEN_REQUEST_URL";
 
-/// The Python package whose `pyproject.toml` is at the repository's root.
+/// A Python package that touchgate releases: the one whose `pyproject.toml`
+/// is at the repository's root, or a member of the uv workspace there.
 pub struct PythonPackage {
     pub name: String,
     pub version: Version,
+    /// The names of the packages in `project.dependencies`, as
+    /// [`normalized_name`] writes them.
+    pub requires: Vec<String>,
     manifest: PathBuf,
 }
 
 impl PythonPackage {
-    /// Reads `[project]` of `root/pyproject.toml`, which must give its
+    /// Reads `[project]` of `dir/pyproject.toml`, which must give its
     /// version itself, not leave it to the build backend.
-    pub fn load(root: &Path) -> Result<Self, Vec<String>> {
-        let manifest = root.join("pyproject.toml");
+    pub fn load(dir: &Path) -> Result<Self, Vec<String>> {
+        let manifest = dir.join("pyproject.toml");
         let text = crate::read(&manifest)?;
         let document: DocumentMut = text
             .parse()
@@ -65,9 +69,18 @@ impl PythonPackage {
             .and_then(Item::as_str)
             .ok_or_else(|| error("no `project.version`"))?;
         let version = Version::parse(version).map_err(|message| error(&message))?;
+        let requires = project
+            .get("dependencies")
+            .and_then(Item::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|requirement| requirement.as_str())
+            .map(|requirement| normalized_name(requirement_name(requirement)))
+            .collect();
         Ok(Self {
             name: name.to_owned(),
             version,
+            requires,
             manifest,
         })
     }
@@ -82,6 +95,14 @@ impl PythonPackage {
     /// Sets `new` as `project.version`, and moves `uv.lock` along if the
     /// package has one.
     pub fn set_version(&self, new: &Version) -> Result<(), Vec<String>> {
+        self.write_version(new, &[])?;
+        lock(self.dir())
+    }
+
+    /// Sets `new` as `project.version`, and moves each requirement in
+    /// `project.dependencies` on one of `siblings`, packages released with
+    /// this one, from `==` the current version to `== new`.
+    pub fn write_version(&self, new: &Version, siblings: &[&str]) -> Result<(), Vec<String>> {
         let text = crate::read(&self.manifest)?;
         let mut document: DocumentMut = text
             .parse()
@@ -96,14 +117,28 @@ impl PythonPackage {
         let decor = value.decor().clone();
         *value = Value::from(new.to_string());
         *value.decor_mut() = decor;
+        if let Some(dependencies) = document["project"]
+            .get_mut("dependencies")
+            .and_then(Item::as_array_mut)
+        {
+            for requirement in dependencies.iter_mut() {
+                let bumped = requirement.as_str().and_then(|text| {
+                    let named = normalized_name(requirement_name(text));
+                    siblings
+                        .iter()
+                        .any(|sibling| normalized_name(sibling) == named)
+                        .then(|| bump_pinned_requirement(text, &self.version, new))
+                        .flatten()
+                });
+                if let Some(bumped) = bumped {
+                    let decor = requirement.decor().clone();
+                    *requirement = Value::from(bumped);
+                    *requirement.decor_mut() = decor;
+                }
+            }
+        }
         std::fs::write(&self.manifest, document.to_string())
             .map_err(|error| vec![format!("{}: {error}", self.manifest.display())])?;
-
-        // `uv lock` records the package's own version, and moves nothing else
-        // that still fits.
-        if self.dir().join("uv.lock").is_file() {
-            crate::run(Command::new("uv").arg("lock").current_dir(self.dir()))?;
-        }
 
         let updated = Self::load(self.dir())?;
         if updated.version != *new {
@@ -147,100 +182,6 @@ impl PythonPackage {
         }
     }
 
-    /// Uploads the built files in `dist` to PyPI, each with an attestation
-    /// that this job made it. Skips the files that PyPI has already, so that a
-    /// release that failed halfway can run again. `dist` must hold the wheels
-    /// and sdist of this version and nothing else.
-    ///
-    /// The job runs with `id-token: write`: both pypi-attestations and
-    /// `uv publish` take this job's identity from GitHub, and PyPI matches it
-    /// to its trusted publisher.
-    pub fn publish(&self, dist: &Path) -> Result<(), Vec<String>> {
-        // Outside GitHub Actions, pypi-attestations would wait for a browser
-        // to sign in instead.
-        if std::env::var(IN_GITHUB_ACTIONS).as_deref() != Ok("true") {
-            return Err(vec![format!(
-                "{IN_GITHUB_ACTIONS} is not `true`. touchgate publishes to PyPI only from a \
-                 GitHub Actions job"
-            )]);
-        }
-        if std::env::var_os(OIDC_REQUEST_URL).is_none() {
-            return Err(vec![format!(
-                "{OIDC_REQUEST_URL} is not set. Give the job that publishes `id-token: write`"
-            )]);
-        }
-        let files = self.release_files(dist)?;
-        let signer = AttestationSigner::install()?;
-        let signed = crate::run(signer.command().arg("sign").args(&files));
-        signer.remove();
-        signed?;
-        // `uv publish` attaches an attestation only if it is among the paths
-        // it is given, beside its file.
-        let mut attestations = Vec::new();
-        for file in &files {
-            let attestation = publish_attestation(file);
-            if !attestation.is_file() {
-                return Err(vec![format!(
-                    "pypi-attestations wrote no {}",
-                    attestation.display()
-                )]);
-            }
-            attestations.push(attestation);
-        }
-        println!("signed {} attestations", attestations.len());
-        let status = Command::new("uv")
-            .args([
-                "publish",
-                "--trusted-publishing",
-                "always",
-                "--check-url",
-                PYPI_INDEX,
-            ])
-            .args(&files)
-            .args(&attestations)
-            .status()
-            .map_err(|error| vec![format!("uv publish: {error}")])?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(vec![format!("uv publish failed: {status}")])
-        }
-    }
-
-    /// Returns the files in `dist`, sorted, each a wheel or the sdist of this
-    /// version.
-    fn release_files(&self, dist: &Path) -> Result<Vec<PathBuf>, Vec<String>> {
-        let entries = std::fs::read_dir(dist)
-            .map_err(|error| vec![format!("{}: {error}", dist.display())])?;
-        let mut files = Vec::new();
-        let mut errors = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|error| vec![format!("{}: {error}", dist.display())])?;
-            let file_name = entry.file_name();
-            match file_name.to_str() {
-                // `uv build` writes one, so that git leaves `dist` alone.
-                Some(".gitignore") => {}
-                Some(name) if self.is_release_file(name) => files.push(entry.path()),
-                _ => errors.push(format!(
-                    "{}: {} is not a wheel or the sdist of {} {}",
-                    dist.display(),
-                    file_name.to_string_lossy(),
-                    self.name,
-                    self.version
-                )),
-            }
-        }
-        if files.is_empty() && errors.is_empty() {
-            errors.push(format!("{}: there is nothing to publish", dist.display()));
-        }
-        if errors.is_empty() {
-            files.sort();
-            Ok(files)
-        } else {
-            Err(errors)
-        }
-    }
-
     /// Returns whether `file` is named as a wheel or the sdist of this version.
     fn is_release_file(&self, file: &str) -> bool {
         let prefix = format!("{}-{}", file_name_part(&self.name), self.version);
@@ -250,6 +191,179 @@ impl PythonPackage {
             None => false,
         }
     }
+}
+
+/// Uploads the built files in `dist` to PyPI, each with an attestation that
+/// this job made it, in the order of `packages`. Skips the files that PyPI has
+/// already, so that a release that failed halfway can run again. `dist` must
+/// hold wheels or an sdist of every package, at its version, and nothing else.
+///
+/// The job runs with `id-token: write`: both pypi-attestations and
+/// `uv publish` take this job's identity from GitHub, and PyPI matches it to
+/// the trusted publisher of each package.
+pub fn publish_packages(packages: &[PythonPackage], dist: &Path) -> Result<(), Vec<String>> {
+    // Outside GitHub Actions, pypi-attestations would wait for a browser to
+    // sign in instead.
+    if std::env::var(IN_GITHUB_ACTIONS).as_deref() != Ok("true") {
+        return Err(vec![format!(
+            "{IN_GITHUB_ACTIONS} is not `true`. touchgate publishes to PyPI only from a \
+             GitHub Actions job"
+        )]);
+    }
+    if std::env::var_os(OIDC_REQUEST_URL).is_none() {
+        return Err(vec![format!(
+            "{OIDC_REQUEST_URL} is not set. Give the job that publishes `id-token: write`"
+        )]);
+    }
+    let names: Vec<String> = std::fs::read_dir(dist)
+        .map_err(|error| vec![format!("{}: {error}", dist.display())])?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .map_err(|error| vec![format!("{}: {error}", dist.display())])
+        })
+        .collect::<Result<_, _>>()?;
+    let files: Vec<PathBuf> = release_files(packages, &names)
+        .map_err(|errors| {
+            errors
+                .into_iter()
+                .map(|error| format!("{}: {error}", dist.display()))
+                .collect::<Vec<_>>()
+        })?
+        .into_iter()
+        .map(|name| dist.join(name))
+        .collect();
+    let signer = AttestationSigner::install()?;
+    let signed = crate::run(signer.command().arg("sign").args(&files));
+    signer.remove();
+    signed?;
+    // `uv publish` attaches an attestation only if it is among the paths it
+    // is given, beside its file.
+    let mut attestations = Vec::new();
+    for file in &files {
+        let attestation = publish_attestation(file);
+        if !attestation.is_file() {
+            return Err(vec![format!(
+                "pypi-attestations wrote no {}",
+                attestation.display()
+            )]);
+        }
+        attestations.push(attestation);
+    }
+    println!("signed {} attestations", attestations.len());
+    let status = Command::new("uv")
+        .args([
+            "publish",
+            "--trusted-publishing",
+            "always",
+            "--check-url",
+            PYPI_INDEX,
+        ])
+        .args(&files)
+        .args(&attestations)
+        .status()
+        .map_err(|error| vec![format!("uv publish: {error}")])?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(vec![format!("uv publish failed: {status}")])
+    }
+}
+
+/// Returns the names among `names`, the files of a directory, of the wheels
+/// and sdists of `packages`: those of the first package, sorted, then those of
+/// the next. Fails if a file belongs to no package, or a package has no file.
+fn release_files(packages: &[PythonPackage], names: &[String]) -> Result<Vec<String>, Vec<String>> {
+    let mut by_package = vec![Vec::new(); packages.len()];
+    let mut errors = Vec::new();
+    for name in names {
+        // `uv build` writes one, so that git leaves `dist` alone.
+        if name == ".gitignore" {
+            continue;
+        }
+        match packages
+            .iter()
+            .position(|package| package.is_release_file(name))
+        {
+            Some(index) => by_package[index].push(name.clone()),
+            None => errors.push(format!(
+                "{name} is not a wheel or the sdist of {}",
+                packages
+                    .iter()
+                    .map(|package| format!("{} {}", package.name, package.version))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            )),
+        }
+    }
+    for (package, files) in packages.iter().zip(&by_package) {
+        if files.is_empty() {
+            errors.push(format!(
+                "there is nothing to publish of {} {}",
+                package.name, package.version
+            ));
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(by_package
+        .into_iter()
+        .flat_map(|mut files| {
+            files.sort();
+            files
+        })
+        .collect())
+}
+
+/// Runs `uv lock` in `dir` if it has a `uv.lock`. The lock records the
+/// versions of the project's own packages, and `uv lock` moves nothing else
+/// that still fits.
+pub fn lock(dir: &Path) -> Result<(), Vec<String>> {
+    if dir.join("uv.lock").is_file() {
+        crate::run(Command::new("uv").arg("lock").current_dir(dir))?;
+    }
+    Ok(())
+}
+
+/// Returns the name at the start of a PEP 508 requirement, such as `frc-core`
+/// in `frc-core == 0.2.0; python_version >= '3.11'`.
+fn requirement_name(requirement: &str) -> &str {
+    let requirement = requirement.trim_start();
+    let end = requirement
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+        .unwrap_or(requirement.len());
+    &requirement[..end]
+}
+
+/// Returns `name` normalized as PEP 503 compares names: lower case, with each
+/// run of `-`, `_` and `.` turned into one `-`.
+pub fn normalized_name(name: &str) -> String {
+    file_name_part(name).replace('_', "-")
+}
+
+/// Returns `requirement` with `new` in place of `old` if its version
+/// specifier is exactly `== old`, with or without spaces, before any
+/// environment marker. A wider specifier is left to hold or fail when uv
+/// locks the workspace.
+fn bump_pinned_requirement(requirement: &str, old: &Version, new: &Version) -> Option<String> {
+    let (specifier, marker) = match requirement.find(';') {
+        Some(at) => requirement.split_at(at),
+        None => (requirement, ""),
+    };
+    let name = requirement_name(specifier);
+    let start = specifier.find(name)? + name.len();
+    let pin = specifier[start..].trim();
+    let pinned = pin.strip_prefix("==")?.trim();
+    if pinned != old.to_string() {
+        return None;
+    }
+    let at = start + specifier[start..].rfind(pinned)?;
+    Some(format!(
+        "{}{new}{}{marker}",
+        &specifier[..at],
+        &specifier[at + pinned.len()..]
+    ))
 }
 
 /// Returns the path where `pypi-attestations sign` writes the attestation of
@@ -286,8 +400,78 @@ mod tests {
         PythonPackage {
             name: name.to_owned(),
             version: Version::parse(version).unwrap(),
+            requires: Vec::new(),
             manifest: PathBuf::from("pyproject.toml"),
         }
+    }
+
+    #[test]
+    fn release_files_of_several_packages() {
+        let packages = [package("frc-core", "0.2.0"), package("frc", "0.2.0")];
+        let names = |names: &[&str]| names.iter().map(|&n| n.to_owned()).collect::<Vec<_>>();
+        let files = release_files(
+            &packages,
+            &names(&[
+                "frc-0.2.0-py3-none-any.whl",
+                "frc_core-0.2.0.tar.gz",
+                ".gitignore",
+                "frc-0.2.0.tar.gz",
+                "frc_core-0.2.0-cp311-abi3-win_amd64.whl",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            files,
+            names(&[
+                "frc_core-0.2.0-cp311-abi3-win_amd64.whl",
+                "frc_core-0.2.0.tar.gz",
+                "frc-0.2.0-py3-none-any.whl",
+                "frc-0.2.0.tar.gz",
+            ])
+        );
+        let errors = release_files(&packages, &names(&["frc-0.2.0.tar.gz", "frc-0.1.0.tar.gz"]))
+            .unwrap_err();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors[0].starts_with("frc-0.1.0.tar.gz is not"),
+            "{errors:?}"
+        );
+        assert!(
+            errors[1].contains("nothing to publish of frc-core"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn requirement_names() {
+        assert_eq!(requirement_name("frc-core == 0.2.0"), "frc-core");
+        assert_eq!(
+            requirement_name("numpy>=1.23.2; python_version == '3.11'"),
+            "numpy"
+        );
+        assert_eq!(requirement_name("Frc.Core[extra]"), "Frc.Core");
+        assert_eq!(normalized_name("Frc_._Core"), "frc-core");
+    }
+
+    #[test]
+    fn pinned_requirements() {
+        let (old, new) = (
+            Version::parse("0.1.3").unwrap(),
+            Version::parse("0.2.0").unwrap(),
+        );
+        let bump = |text: &str| bump_pinned_requirement(text, &old, &new);
+        assert_eq!(
+            bump("frc-core == 0.1.3").as_deref(),
+            Some("frc-core == 0.2.0")
+        );
+        assert_eq!(bump("frc-core==0.1.3").as_deref(), Some("frc-core==0.2.0"));
+        assert_eq!(
+            bump("frc-core ==0.1.3 ; python_version >= '3.11'").as_deref(),
+            Some("frc-core ==0.2.0 ; python_version >= '3.11'")
+        );
+        assert_eq!(bump("frc-core >= 0.1.3"), None);
+        assert_eq!(bump("frc-core == 0.1.30"), None);
+        assert_eq!(bump("frc-core"), None);
     }
 
     #[test]
@@ -347,6 +531,28 @@ mod tests {
         .unwrap();
         let errors = PythonPackage::load(&dir).err().unwrap();
         assert!(errors[0].contains("is dynamic"), "{errors:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn moves_pins_on_siblings_with_the_version() {
+        let dir = std::env::temp_dir().join(format!("touchgate-siblings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("pyproject.toml");
+        std::fs::write(
+            &manifest,
+            "[project]\nname = \"frc\"\nversion = \"0.1.3\"\ndependencies = [\n    \"numpy == 0.1.3\",\n    \"frc-core == 0.1.3\", # released with frc\n]\n",
+        )
+        .unwrap();
+        let package = PythonPackage::load(&dir).unwrap();
+        assert_eq!(package.requires, ["numpy", "frc-core"]);
+        package
+            .write_version(&Version::parse("0.2.0").unwrap(), &["frc", "frc_core"])
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            "[project]\nname = \"frc\"\nversion = \"0.2.0\"\ndependencies = [\n    \"numpy == 0.1.3\",\n    \"frc-core == 0.2.0\", # released with frc\n]\n"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
