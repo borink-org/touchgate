@@ -98,9 +98,13 @@ fn main() -> ExitCode {
 /// Everything the project releases must be at one version, and the newest
 /// released section of the changelog must be that version.
 fn check() -> Result<Version, Vec<String>> {
-    let project = Project::load()?;
+    check_project(&Project::load()?)
+}
+
+/// Does what [`check`] does for `project`.
+fn check_project(project: &Project) -> Result<Version, Vec<String>> {
     let version = project.version()?;
-    let text = read(&changelog_path(&project))?;
+    let text = read(&changelog_path(project))?;
     let changelog = Changelog::parse(&text)?;
     match changelog.newest_release() {
         Some((newest, _)) if *newest == version => Ok(version),
@@ -153,11 +157,13 @@ fn prepare(version: &str, args: &[&str]) -> Result<(), Vec<String>> {
             _ => return Err(vec![USAGE.to_owned()]),
         }
     }
-    let prepared = prepare_release(version, date.unwrap_or_else(Date::today))?;
+    let root = project::repository_root()?;
+    let prepared = prepare_release(&root, version, date.unwrap_or_else(Date::today))?;
     println!("{}", prepared.version);
     if pull_request {
         let project = Project::load()?;
         let outcome = github::pull_request(
+            &root,
             &prepared.version,
             prepared.preparation,
             &changelog_in_repository(&project)?,
@@ -183,10 +189,15 @@ struct PreparedRelease {
     preparation: github::Preparation,
 }
 
-/// Does what [`prepare`] does to the checkout, without committing it.
-fn prepare_release(version: Version, date: Date) -> Result<PreparedRelease, Vec<String>> {
-    let current = check()?;
-    let project = Project::load()?;
+/// Does what [`prepare`] does to the checkout whose top directory is
+/// `root`, without committing it.
+fn prepare_release(
+    root: &Path,
+    version: Version,
+    date: Date,
+) -> Result<PreparedRelease, Vec<String>> {
+    let project = Project::load_at(root)?;
+    let current = check_project(&project)?;
     let path = changelog_path(&project);
     let text = read(&path)?;
     let write = |text: String| {
@@ -214,7 +225,7 @@ fn prepare_release(version: Version, date: Date) -> Result<PreparedRelease, Vec<
         project.set_version(&version)?;
         github::Preparation::New
     };
-    let checked = check()?;
+    let checked = check_project(&Project::load_at(root)?)?;
     assert_eq!(checked, version);
     Ok(PreparedRelease {
         version,
@@ -788,12 +799,10 @@ fn publish_crates(workspace: &Workspace, cargo_args: &[&str]) -> Result<(), Vec<
 }
 
 /// Returns the path of the changelog in the git repository, which a link on
-/// GitHub names.
+/// GitHub names. The project's root is the top directory of its checkout.
 fn changelog_in_repository(project: &Project) -> Result<String, Vec<String>> {
-    let top =
-        PathBuf::from(run(Command::new("git").args(["rev-parse", "--show-toplevel"]))?.trim_end());
     let path = changelog_path(project);
-    let relative = path.strip_prefix(&top).unwrap_or(&path);
+    let relative = path.strip_prefix(project.root()).unwrap_or(&path);
     relative
         .to_str()
         .map(str::to_owned)

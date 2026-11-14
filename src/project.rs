@@ -145,14 +145,20 @@ pub enum Project {
 impl Project {
     /// Reads what the repository releases, as [`ReleaseKind::detect`] tells.
     pub fn load() -> Result<Self, Vec<String>> {
-        let root = repository_root()?;
+        Self::load_at(&repository_root()?)
+    }
+
+    /// Reads the project at `root`, the top directory of a git checkout, as
+    /// [`Project::load`] reads the one of the current directory.
+    pub fn load_at(root: &Path) -> Result<Self, Vec<String>> {
+        let root = root.to_path_buf();
         match ReleaseKind::detect(&root)? {
-            ReleaseKind::CratesIo => Ok(Self::Crates(Workspace::load(Members::Published)?)),
+            ReleaseKind::CratesIo => Ok(Self::Crates(Workspace::load(&root, Members::Published)?)),
             ReleaseKind::PyPi { extension } => Ok(Self::Python {
                 package: PythonPackage::load(&root)?,
                 extension: match extension {
                     Extension::None => None,
-                    Extension::Maturin => Some(Workspace::load(Members::All)?),
+                    Extension::Maturin => Some(Workspace::load(&root, Members::All)?),
                 },
             }),
             ReleaseKind::UvWorkspace { members } => Ok(Self::UvWorkspace {
@@ -163,7 +169,7 @@ impl Project {
                 crates: root
                     .join("Cargo.toml")
                     .is_file()
-                    .then(|| Workspace::load(Members::All))
+                    .then(|| Workspace::load(&root, Members::All))
                     .transpose()?,
                 root,
             }),
@@ -315,7 +321,7 @@ fn load_member(root: &Path, member: &str) -> Result<PythonPackage, Vec<String>> 
 }
 
 /// Returns the top directory of the git repository the current directory is in.
-fn repository_root() -> Result<PathBuf, Vec<String>> {
+pub fn repository_root() -> Result<PathBuf, Vec<String>> {
     let top = crate::run(Command::new("git").args(["rev-parse", "--show-toplevel"]))?;
     Ok(PathBuf::from(top.trim_end()))
 }

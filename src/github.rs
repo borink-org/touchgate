@@ -2,6 +2,7 @@
 //! GitHub's runners carry. `gh` finds the repository from the checkout, and
 //! its token from `GH_TOKEN`.
 
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -141,15 +142,16 @@ impl GitHubRelease {
     not(feature = "tui"),
     expect(
         dead_code,
-        reason = "only the interactive touchgate commits as the checkout"
+        reason = "only the interactive touchgate commits as the configured identity"
     )
 )]
 pub enum CommitAuthor {
     /// The GitHub Actions bot, without hooks, in the `touchgate` workflow.
     ActionsBot,
-    /// The identity that the checkout's git configuration names, with its
-    /// hooks and its signing, on a person's machine.
-    Checkout,
+    /// The identity that git's configuration names, with its hooks and its
+    /// signing, on a person's machine. The commit goes where `HEAD` is, such
+    /// as on a detached worktree.
+    Configured,
 }
 
 impl CommitAuthor {
@@ -165,7 +167,7 @@ impl CommitAuthor {
                 "commit",
                 "--no-verify",
             ],
-            Self::Checkout => vec!["commit"],
+            Self::Configured => vec!["commit"],
         };
         args.extend(["--all", "--message", message]);
         args
@@ -189,14 +191,16 @@ pub enum PullRequestOutcome {
     Updated(String),
 }
 
-/// Commits the prepared release on its branch as `author`, pushes it, and
-/// opens a pull request for it, or updates the one that is open. `changelog`
-/// is the changelog's path in the repository, and `registries` where the
-/// release publishes to.
+/// Commits the prepared release in the checkout at `dir` as `author`,
+/// pushes it to its branch, and opens a pull request for it, or updates the
+/// one that is open. `changelog` is the changelog's path in the repository,
+/// and `registries` where the release publishes to.
 ///
-/// As [`CommitAuthor::Checkout`], it replaces a local release branch left
-/// from an earlier try, and switches back to the branch it started on.
+/// As [`CommitAuthor::ActionsBot`], it commits on a new local branch of the
+/// release's name. As [`CommitAuthor::Configured`], it commits where `HEAD`
+/// is, and makes no local branch.
 pub fn pull_request(
+    dir: &Path,
     version: &Version,
     preparation: Preparation,
     changelog: &str,
@@ -204,24 +208,26 @@ pub fn pull_request(
     author: CommitAuthor,
 ) -> Result<PullRequestOutcome, String> {
     let release = GitHubRelease::of(version, changelog)?;
-    if git(&["status", "--porcelain"])?.is_empty() {
+    if git_in(dir, &["status", "--porcelain"])?.is_empty() {
         return Ok(PullRequestOutcome::NoChange);
     }
     let branch = release_branch(version);
-    match author {
-        CommitAuthor::ActionsBot => git(&["switch", "--create", &branch])?,
-        CommitAuthor::Checkout => git(&["switch", "--force-create", &branch])?,
-    };
-    git(&author.commit_args(&preparation.commit_message(version)))?;
-    git(&[
-        "push",
-        "--force",
-        "origin",
-        &format!("HEAD:refs/heads/{branch}"),
-    ])?;
-    if let CommitAuthor::Checkout = author {
-        git(&["switch", "-"])?;
+    if let CommitAuthor::ActionsBot = author {
+        git_in(dir, &["switch", "--create", &branch])?;
     }
+    git_in(
+        dir,
+        &author.commit_args(&preparation.commit_message(version)),
+    )?;
+    git_in(
+        dir,
+        &[
+            "push",
+            "--force",
+            "origin",
+            &format!("HEAD:refs/heads/{branch}"),
+        ],
+    )?;
 
     let body = format!(
         "Prepares the release of {version} to {registry}.
@@ -253,16 +259,23 @@ touchgate approve
     }
 }
 
-/// Commits the prepared release as the checkout's identity, and pushes it to
-/// `branch` on origin, the default branch.
+/// Commits the prepared release in the checkout at `dir` as git's configured
+/// identity, and pushes it to `branch` on origin, the default branch.
 #[cfg(feature = "tui")]
 pub fn push_release(
+    dir: &Path,
     version: &Version,
     preparation: Preparation,
     branch: &str,
 ) -> Result<(), String> {
-    git(&CommitAuthor::Checkout.commit_args(&preparation.commit_message(version)))?;
-    git(&["push", "origin", &format!("HEAD:refs/heads/{branch}")])?;
+    git_in(
+        dir,
+        &CommitAuthor::Configured.commit_args(&preparation.commit_message(version)),
+    )?;
+    git_in(
+        dir,
+        &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
+    )?;
     Ok(())
 }
 
@@ -480,8 +493,10 @@ pub fn gh(args: &[&str]) -> Result<String, String> {
     output("gh", command.args(args))
 }
 
-fn git(args: &[&str]) -> Result<String, String> {
-    output("git", Command::new("git").args(args))
+/// Runs `git` in the checkout at `dir`, and returns its standard output, or
+/// its standard error as the error.
+fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
+    output("git", Command::new("git").arg("-C").arg(dir).args(args))
 }
 
 fn output(name: &str, command: &mut Command) -> Result<String, String> {

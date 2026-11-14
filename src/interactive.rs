@@ -4,8 +4,9 @@
 //! It fetches the default branch and starts where the release is:
 //!
 //! 1. With entries under `## Unreleased`, it prepares a version that you
-//!    pick, and commits it. It pushes the commit to the default branch, or
-//!    opens a pull request and follows its checks until you merge it.
+//!    pick in a worktree of its own, and commits it there. It pushes the
+//!    commit to the default branch, or opens a pull request and follows its
+//!    checks until you merge it. Your checkout stays as it is.
 //! 2. With a prepared release that no tag names, it shows the commits since
 //!    the last release, and signs the approval when you press `a`.
 //! 3. It starts `release.yml` with the approval and follows the run.
@@ -76,16 +77,53 @@ enum Stage {
 /// A release to prepare, with the version and the way it lands still to
 /// pick.
 struct Preparing {
+    /// The worktree that the release is prepared in.
+    worktree: Worktree,
+    /// The version to prepare again, to date it anew, if the release is not
+    /// a new version.
+    again: Option<Version>,
     /// The lines under `## Unreleased`.
     unreleased: Vec<String>,
+    pick: Pick,
+    /// Why the last try failed.
+    notice: Option<String>,
+}
+
+/// The version to prepare and the way it lands, as picked so far.
+struct Pick {
     choices: Vec<VersionChoice>,
     /// The index of the version picked.
     selected: usize,
     /// The index of the version that the unreleased entries suggest.
     suggested: usize,
     landing: Landing,
-    /// Why the last try failed.
-    notice: Option<String>,
+}
+
+impl Pick {
+    /// Returns the version picked.
+    fn version(&self) -> &Version {
+        &self.choices[self.selected].version
+    }
+
+    /// Changes the pick for the key `pressed`: `j` and `k` pick the next and
+    /// the previous version, `g` and `G` the first and the last, and `h` and
+    /// `l` a push and a pull request. The arrow keys work too, and Tab
+    /// switches the landing.
+    fn respond(&mut self, pressed: Key) {
+        let last = self.choices.len() - 1;
+        self.selected = match pressed {
+            Key::Char('k') | Key::Up => self.selected.saturating_sub(1),
+            Key::Char('j') | Key::Down => (self.selected + 1).min(last),
+            Key::Char('g') | Key::Home => 0,
+            Key::Char('G') | Key::End => last,
+            _ => self.selected,
+        };
+        self.landing = match (pressed, self.landing) {
+            (Key::Char('h') | Key::Left, _) | (Key::Tab, Landing::PullRequest) => Landing::Push,
+            (Key::Char('l') | Key::Right, _) | (Key::Tab, Landing::Push) => Landing::PullRequest,
+            (_, landing) => landing,
+        };
+    }
 }
 
 /// A version to pick, and what kind of release it is.
@@ -95,7 +133,7 @@ struct VersionChoice {
 }
 
 /// How a prepared release reaches the default branch.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Landing {
     /// A push to the default branch.
     Push,
@@ -108,16 +146,45 @@ enum Landed {
     Pushed,
     /// It opened or updated the pull request at this URL.
     PullRequest(String),
-    /// The checkout already held the prepared release.
+    /// The worktree already held the prepared release.
     Unchanged,
 }
 
-/// Why preparing a release failed.
-enum Failure {
-    /// It failed before it changed the checkout.
-    Unchanged(String),
-    /// It failed after it changed the checkout, which keeps the change.
-    Changed(String),
+/// A detached worktree of the default branch as origin has it, in which a
+/// release is prepared without touching your checkout. Dropping it removes
+/// it.
+struct Worktree {
+    /// The temporary directory that holds the worktree.
+    dir: PathBuf,
+    /// The top directory of the worktree, in `dir`.
+    path: PathBuf,
+}
+
+impl Worktree {
+    /// Adds a worktree of the default branch of `repository`, as fetched.
+    fn of_default_branch(repository: &Repository) -> Result<Self, Vec<String>> {
+        let dir = crate::approval::private_temp_dir().map_err(|error| vec![error])?;
+        let path = dir.join(repository.name.rsplit('/').next().unwrap_or("checkout"));
+        let added = crate::run(
+            Command::new("git")
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(&path)
+                .arg(crate::tracking_ref(repository)),
+        );
+        let worktree = Self { dir, path };
+        added?;
+        Ok(worktree)
+    }
+}
+
+impl Drop for Worktree {
+    fn drop(&mut self) {
+        let _ = Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.path)
+            .output();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 /// A release pull request that waits for its checks and for you to merge it.
@@ -181,7 +248,7 @@ fn inspect_release(repository: &Repository) -> Result<Stage, Vec<String>> {
     let tracking = crate::tracking_ref(repository);
     let text = crate::run(Command::new("git").args(["show", &format!("{tracking}:CHANGELOG.md")]))?;
     if !changelog::unreleased_entries(&text).is_empty() {
-        return preparing(repository, None);
+        return preparation_of(repository, None);
     }
     let changelog = Changelog::parse(&text)?;
     let (version, _) = changelog
@@ -215,24 +282,22 @@ fn is_tagged(version: &Version) -> Result<bool, Vec<String>> {
         .map_err(|error| vec![format!("git: {error}")])
 }
 
-/// Returns the preparation of the release in the checkout, which must be on
-/// the default branch as origin has it. With `again`, prepares that version
+/// Returns the preparation of the release of the default branch as origin
+/// has it, in a worktree of its own. With `again`, prepares that version
 /// again, to date it anew.
-fn preparing(repository: &Repository, again: Option<Version>) -> Result<Stage, Vec<String>> {
-    if let Some(reason) = checkout_problem(repository)? {
-        return Ok(Stage::Blocked(reason));
-    }
-    let project = Project::load()?;
+fn preparation_of(repository: &Repository, again: Option<Version>) -> Result<Stage, Vec<String>> {
+    let worktree = Worktree::of_default_branch(repository)?;
+    let project = Project::load_at(&worktree.path)?;
     let current = project.version()?;
     let text = crate::read(&crate::changelog_path(&project))?;
     let unreleased: Vec<String> = changelog::unreleased_lines(&text)
         .into_iter()
         .map(str::to_owned)
         .collect();
-    let (choices, suggested) = match again {
+    let (choices, suggested) = match &again {
         Some(version) => (
             vec![VersionChoice {
-                version,
+                version: version.clone(),
                 kind: "dated anew",
             }],
             0,
@@ -244,63 +309,26 @@ fn preparing(repository: &Repository, again: Option<Version>) -> Result<Stage, V
         _ => Landing::Push,
     };
     Ok(Stage::Preparing(Preparing {
+        worktree,
+        again,
         unreleased,
-        choices,
-        selected: suggested,
-        suggested,
-        landing,
+        pick: Pick {
+            choices,
+            selected: suggested,
+            suggested,
+            landing,
+        },
         notice: None,
     }))
 }
 
-/// Returns why the checkout cannot prepare a release, if it cannot. It must
-/// be on the default branch, with no uncommitted changes and no commits that
-/// origin does not have. A checkout behind origin is fast-forwarded.
-fn checkout_problem(repository: &Repository) -> Result<Option<String>, Vec<String>> {
-    let default = &repository.default_branch;
-    let branch = Command::new("git")
-        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .output()
-        .map_err(|error| vec![format!("git: {error}")])?;
-    let branch = String::from_utf8_lossy(&branch.stdout).trim().to_owned();
-    if branch != *default {
-        let on = if branch.is_empty() {
-            "a detached HEAD".to_owned()
-        } else {
-            branch
-        };
-        return Ok(Some(format!(
-            "The checkout is on {on}. Switch to {default} to prepare a release, then press r."
-        )));
-    }
-    if has_uncommitted_changes()? {
-        return Ok(Some(
-            "The checkout has uncommitted changes. Commit or stash them, then press r.".to_owned(),
-        ));
-    }
-    let tracking = crate::tracking_ref(repository);
-    let counts = crate::run(Command::new("git").args([
-        "rev-list",
-        "--left-right",
-        "--count",
-        &format!("HEAD...{tracking}"),
+/// Returns whether a tracked file in the checkout at `dir` has changed.
+fn has_uncommitted_changes(dir: &Path) -> Result<bool, Vec<String>> {
+    let changed = crate::run(Command::new("git").arg("-C").arg(dir).args([
+        "status",
+        "--porcelain",
+        "--untracked-files=no",
     ]))?;
-    let (ahead, behind) = counts.trim().split_once('\t').unwrap_or(("0", "0"));
-    if ahead != "0" {
-        return Ok(Some(format!(
-            "{default} has {ahead} commit(s) that origin does not have. Push them, then press r."
-        )));
-    }
-    if behind != "0" {
-        crate::run(Command::new("git").args(["merge", "--ff-only", "--quiet", &tracking]))?;
-    }
-    Ok(None)
-}
-
-/// Returns whether a tracked file in the checkout has changed.
-fn has_uncommitted_changes() -> Result<bool, Vec<String>> {
-    let changed =
-        crate::run(Command::new("git").args(["status", "--porcelain", "--untracked-files=no"]))?;
     Ok(!changed.is_empty())
 }
 
@@ -434,24 +462,7 @@ impl Screen {
                 _ => Response::Nothing,
             },
             Stage::Preparing(preparing) => {
-                let last = preparing.choices.len() - 1;
-                let selected = preparing.selected;
-                preparing.selected = match pressed {
-                    Key::Char('k') | Key::Up => selected.saturating_sub(1),
-                    Key::Char('j') | Key::Down => (selected + 1).min(last),
-                    Key::Char('g') | Key::Home => 0,
-                    Key::Char('G') | Key::End => last,
-                    _ => selected,
-                };
-                preparing.landing = match pressed {
-                    Key::Char('h') | Key::Left => Landing::Push,
-                    Key::Char('l') | Key::Right => Landing::PullRequest,
-                    Key::Tab => match preparing.landing {
-                        Landing::Push => Landing::PullRequest,
-                        Landing::PullRequest => Landing::Push,
-                    },
-                    _ => preparing.landing,
-                };
+                preparing.pick.respond(pressed);
                 match pressed {
                     Key::Enter => Response::Prepare,
                     Key::Char('r') => Response::Inspect,
@@ -484,15 +495,16 @@ impl Screen {
         }
     }
 
-    /// Prepares the picked version and lands it as picked. If that fails
-    /// before anything changed, stays on the preparation and says why.
+    /// Prepares the picked version and lands it as picked. If that fails,
+    /// starts the preparation over in a new worktree, and says why.
     fn prepare(&mut self, terminal: &mut RawTerminal) {
         let Stage::Preparing(preparing) = &self.stage else {
             return;
         };
-        let version = preparing.choices[preparing.selected].version.clone();
-        let landing = preparing.landing;
-        match self.prepare_and_land(terminal, &version, landing) {
+        let version = preparing.pick.version().clone();
+        let landing = preparing.pick.landing;
+        let dir = preparing.worktree.path.clone();
+        match self.prepare_and_land(terminal, &dir, &version, landing) {
             Ok(Landed::Pushed | Landed::Unchanged) => self.stage = inspect(&self.repository),
             Ok(Landed::PullRequest(url)) => {
                 let (sender, receiver) = mpsc::channel();
@@ -508,39 +520,39 @@ impl Screen {
                     told_failed: false,
                 });
             }
-            Err(Failure::Unchanged(error)) => {
-                if let Stage::Preparing(preparing) = &mut self.stage {
-                    preparing.notice = Some(error);
-                }
-            }
-            Err(Failure::Changed(error)) => {
-                self.stage = Stage::Blocked(format!(
-                    "{error} The checkout keeps what was prepared. Land it yourself, or undo it, \
-                     then press r."
-                ));
+            Err(error) => {
+                let Stage::Preparing(old) = &self.stage else {
+                    return;
+                };
+                let (again, selected) = (old.again.clone(), old.pick.selected);
+                self.stage = match preparation_of(&self.repository, again) {
+                    Ok(Stage::Preparing(mut fresh)) => {
+                        fresh.pick.selected = selected.min(fresh.pick.choices.len() - 1);
+                        fresh.pick.landing = landing;
+                        fresh.notice = Some(error);
+                        Stage::Preparing(fresh)
+                    }
+                    Ok(stage) => stage,
+                    Err(errors) => Stage::Blocked(format!("{error} {}", errors.join(" "))),
+                };
             }
         }
     }
 
-    /// Writes the release of `version` into the checkout, commits it, and
-    /// lands it by `landing`, with the screen stepped aside while git runs.
+    /// Writes the release of `version` into the worktree at `dir`, commits
+    /// it, and lands it by `landing`, with the screen stepped aside while git
+    /// runs.
     fn prepare_and_land(
         &self,
         terminal: &mut RawTerminal,
+        dir: &Path,
         version: &Version,
         landing: Landing,
-    ) -> Result<Landed, Failure> {
-        let changed = |errors: Vec<String>| Failure::Changed(errors.join(" "));
-        // Preparing writes the changelog first, so a failure after it leaves
-        // a change; one before it, such as a check, leaves none.
+    ) -> Result<Landed, String> {
+        let failed = |errors: Vec<String>| errors.join(" ");
         let prepared =
-            crate::prepare_release(version.clone(), Date::today()).map_err(|errors| {
-                match has_uncommitted_changes() {
-                    Ok(false) => Failure::Unchanged(errors.join(" ")),
-                    _ => changed(errors),
-                }
-            })?;
-        if !has_uncommitted_changes().map_err(changed)? {
+            crate::prepare_release(dir, version.clone(), Date::today()).map_err(failed)?;
+        if !has_uncommitted_changes(dir).map_err(failed)? {
             return Ok(Landed::Unchanged);
         }
         let default = &self.repository.default_branch;
@@ -549,23 +561,20 @@ impl Screen {
                 format!("Committing the {version} release and pushing it to {default}.")
             }
             Landing::PullRequest => format!(
-                "Committing the {version} release on {} and opening its pull request.",
+                "Committing the {version} release and opening its pull request from {}.",
                 github::release_branch(version)
             ),
         };
-        let landed = terminal
-            .suspended(|| {
-                println!("{heading}");
-                match landing {
-                    Landing::Push => {
-                        github::push_release(&prepared.version, prepared.preparation, default)
-                            .map(|()| Landed::Pushed)
-                    }
-                    Landing::PullRequest => open_pull_request(&prepared),
+        terminal.suspended(|| {
+            println!("{heading}");
+            match landing {
+                Landing::Push => {
+                    github::push_release(dir, &prepared.version, prepared.preparation, default)
+                        .map(|()| Landed::Pushed)
                 }
-            })
-            .map_err(Failure::Changed)?;
-        landed.map_err(Failure::Changed)
+                Landing::PullRequest => open_pull_request(dir, &prepared),
+            }
+        })?
     }
 
     /// Prepares the reviewed release again, to date it anew.
@@ -574,7 +583,7 @@ impl Screen {
             return;
         };
         let version = reviewing.plan.version.clone();
-        self.stage = preparing(&self.repository, Some(version))
+        self.stage = preparation_of(&self.repository, Some(version))
             .unwrap_or_else(|errors| Stage::Blocked(errors.join(" ")));
     }
 
@@ -789,17 +798,18 @@ impl Screen {
     }
 }
 
-/// Commits the `prepared` release on its branch as the checkout's identity,
-/// pushes it and opens its pull request.
-fn open_pull_request(prepared: &crate::PreparedRelease) -> Result<Landed, String> {
-    let project = Project::load().map_err(|errors| errors.join(" "))?;
+/// Commits the `prepared` release in the worktree at `dir` as git's
+/// configured identity, pushes it to its branch and opens its pull request.
+fn open_pull_request(dir: &Path, prepared: &crate::PreparedRelease) -> Result<Landed, String> {
+    let project = Project::load_at(dir).map_err(|errors| errors.join(" "))?;
     let changelog = crate::changelog_in_repository(&project).map_err(|errors| errors.join(" "))?;
     let outcome = github::pull_request(
+        dir,
         &prepared.version,
         prepared.preparation,
         &changelog,
         &project.registries(),
-        CommitAuthor::Checkout,
+        CommitAuthor::Configured,
     )?;
     Ok(match outcome {
         PullRequestOutcome::NoChange => Landed::Unchanged,
@@ -890,7 +900,7 @@ fn preparing_lines(
     columns: usize,
     rows: usize,
 ) {
-    let room = rows.saturating_sub(PREPARE_CHROME + preparing.choices.len());
+    let room = rows.saturating_sub(PREPARE_CHROME + preparing.pick.choices.len());
     lines.push(vec![Span::styled(
         if preparing.unreleased.is_empty() {
             "Nothing is under ## Unreleased."
@@ -929,8 +939,8 @@ fn preparing_lines(
         )]);
     }
     lines.push(vec![]);
-    for (index, choice) in preparing.choices.iter().enumerate() {
-        let picked = index == preparing.selected;
+    for (index, choice) in preparing.pick.choices.iter().enumerate() {
+        let picked = index == preparing.pick.selected;
         let mut line = vec![
             Span::plain(if index == 0 {
                 "Version   "
@@ -948,12 +958,12 @@ fn preparing_lines(
             ),
             Span::styled(format!("  {}", choice.kind), Style::Dim),
         ];
-        if index == preparing.suggested && preparing.choices.len() > 1 {
+        if index == preparing.pick.suggested && preparing.pick.choices.len() > 1 {
             line.push(Span::styled(", suggested", Style::Dim));
         }
         lines.push(line);
     }
-    let version = &preparing.choices[preparing.selected].version;
+    let version = &preparing.pick.choices[preparing.pick.selected].version;
     let mut landing = vec![Span::plain("Lands by  ")];
     for (each, text) in [
         (Landing::Push, format!("a push to {default}")),
@@ -962,7 +972,7 @@ fn preparing_lines(
             format!("a pull request from {}", github::release_branch(version)),
         ),
     ] {
-        if each == preparing.landing {
+        if each == preparing.pick.landing {
             landing.push(Span::styled("● ", Style::Accent));
             landing.push(Span::styled(text, Style::Bold));
         } else {
@@ -978,7 +988,7 @@ fn preparing_lines(
     }
     let action = format!("prepare {version}");
     let mut keys = vec![("enter", action.as_str())];
-    if preparing.choices.len() > 1 {
+    if preparing.pick.choices.len() > 1 {
         keys.push(("j/k", "version"));
     }
     keys.extend([("h/l", "push or pull request"), ("q", "quit")]);
@@ -1216,42 +1226,25 @@ mod tests {
 
     #[test]
     fn picks_a_version_and_a_landing_with_vim_keys() {
-        let current = Version::parse("0.2.0").unwrap();
-        let (choices, suggested) = version_choices(&current, &[]);
-        let mut screen = screen_at(Stage::Preparing(Preparing {
-            unreleased: Vec::new(),
+        let (choices, suggested) = version_choices(&Version::parse("0.2.0").unwrap(), &[]);
+        let mut pick = Pick {
             choices,
             selected: suggested,
             suggested,
             landing: Landing::Push,
-            notice: None,
-        }));
-        let mut press = |key| {
-            let response = screen.respond(key, 24);
-            let Stage::Preparing(preparing) = &screen.stage else {
-                panic!("the screen left the preparation");
-            };
-            let version = preparing.choices[preparing.selected].version.to_string();
-            (version, preparing.landing, response)
         };
-        assert!(
-            matches!(press(Key::Char('j')), (v, Landing::Push, Response::Nothing) if v == "0.3.0")
-        );
-        assert!(matches!(press(Key::Char('G')), (v, _, _) if v == "1.0.0"));
-        assert!(matches!(press(Key::Char('j')), (v, _, _) if v == "1.0.0"));
-        assert!(matches!(press(Key::Char('g')), (v, _, _) if v == "0.2.1"));
-        assert!(matches!(
-            press(Key::Char('l')),
-            (_, Landing::PullRequest, _)
-        ));
-        assert!(matches!(
-            press(Key::Char('l')),
-            (_, Landing::PullRequest, _)
-        ));
-        assert!(matches!(press(Key::Char('h')), (_, Landing::Push, _)));
-        assert!(matches!(press(Key::Escape), (_, _, Response::Nothing)));
-        assert!(matches!(press(Key::Enter), (_, _, Response::Prepare)));
-        assert!(matches!(press(Key::Char('q')), (_, _, Response::Quit)));
+        let mut press = |key| {
+            pick.respond(key);
+            (pick.version().to_string(), pick.landing)
+        };
+        assert_eq!(press(Key::Char('j')), ("0.3.0".to_owned(), Landing::Push));
+        assert_eq!(press(Key::Char('G')).0, "1.0.0");
+        assert_eq!(press(Key::Char('j')).0, "1.0.0");
+        assert_eq!(press(Key::Char('g')).0, "0.2.1");
+        assert_eq!(press(Key::Char('l')).1, Landing::PullRequest);
+        assert_eq!(press(Key::Char('l')).1, Landing::PullRequest);
+        assert_eq!(press(Key::Char('h')).1, Landing::Push);
+        assert_eq!(press(Key::Tab).1, Landing::PullRequest);
     }
 
     #[test]
@@ -1291,6 +1284,12 @@ mod tests {
         assert_eq!(press(Key::Char('G')), 27);
         assert_eq!(press(Key::Char('g')), 0);
         assert_eq!(press(Key::Char('k')), 0);
+        assert!(matches!(screen.respond(Key::Escape, 24), Response::Nothing));
+        assert!(matches!(
+            screen.respond(Key::Char('a'), 24),
+            Response::Approve
+        ));
+        assert!(matches!(screen.respond(Key::Char('q'), 24), Response::Quit));
     }
 
     #[test]

@@ -31,7 +31,7 @@ impl Package {
     }
 }
 
-/// The workspace in the current directory.
+/// A Cargo workspace.
 pub struct Workspace {
     pub root: PathBuf,
     pub packages: Vec<Package>,
@@ -50,9 +50,9 @@ pub enum Members {
 }
 
 impl Workspace {
-    /// Reads the workspace with `cargo metadata`.
-    pub fn load(released: Members) -> Result<Self, Vec<String>> {
-        let output = crate::run(Command::new("cargo").args([
+    /// Reads the workspace that `dir` is in with `cargo metadata`.
+    pub fn load(dir: &Path, released: Members) -> Result<Self, Vec<String>> {
+        let output = crate::run(Command::new("cargo").current_dir(dir).args([
             "metadata",
             "--format-version",
             "1",
@@ -202,9 +202,13 @@ impl Workspace {
         }
         // Resolving the workspace moves the published packages' entries in
         // `Cargo.lock` to the new version, and upgrades nothing else.
-        crate::run(Command::new("cargo").args(["metadata", "--format-version", "1"]))?;
+        crate::run(Command::new("cargo").current_dir(&self.root).args([
+            "metadata",
+            "--format-version",
+            "1",
+        ]))?;
 
-        let updated = Self::load(self.released)?;
+        let updated = Self::load(&self.root, self.released)?;
         let version = updated.version()?;
         if version != new {
             return Err(vec![format!(
