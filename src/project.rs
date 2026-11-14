@@ -135,8 +135,8 @@ pub enum Project {
     /// crates.io. Every package of both moves to the release's version.
     UvWorkspace {
         root: PathBuf,
-        /// In the order they are uploaded: each after the packages it
-        /// requires.
+        /// In the order the workspace lists them, which is the order they are
+        /// uploaded in.
         packages: Vec<PythonPackage>,
         crates: Option<Workspace>,
     },
@@ -155,42 +155,31 @@ impl Project {
                     Extension::Maturin => Some(Workspace::load(Members::All)?),
                 },
             }),
-            ReleaseKind::UvWorkspace { members } => {
-                let mut packages = Vec::new();
-                for dir in member_dirs(&root, &members)? {
-                    packages.push(PythonPackage::load(&dir)?);
-                }
-                let crates = if root.join("Cargo.toml").is_file() {
-                    Some(Workspace::load(Members::All)?)
-                } else {
-                    None
-                };
-                Ok(Self::UvWorkspace {
-                    root,
-                    packages: upload_order(packages),
-                    crates,
-                })
-            }
+            ReleaseKind::UvWorkspace { members } => Ok(Self::UvWorkspace {
+                packages: members
+                    .iter()
+                    .map(|member| load_member(&root, member))
+                    .collect::<Result<_, _>>()?,
+                crates: root
+                    .join("Cargo.toml")
+                    .is_file()
+                    .then(|| Workspace::load(Members::All))
+                    .transpose()?,
+                root,
+            }),
         }
     }
 
     /// Returns the registries the project publishes to.
     pub fn registries(&self) -> Vec<Registry> {
-        match self {
-            Self::Crates(_) => vec![Registry::CratesIo],
-            Self::Python { .. } => vec![Registry::PyPi],
-            Self::UvWorkspace { crates, .. } => {
-                let mut registries = Vec::new();
-                if crates
-                    .as_ref()
-                    .is_some_and(|crates| crates.published().next().is_some())
-                {
-                    registries.push(Registry::CratesIo);
-                }
-                registries.push(Registry::PyPi);
-                registries
-            }
+        let mut registries = Vec::new();
+        if self.published_crates().is_some() {
+            registries.push(Registry::CratesIo);
         }
+        if !self.python_packages().is_empty() {
+            registries.push(Registry::PyPi);
+        }
+        registries
     }
 
     /// Returns the Python packages that the project publishes to PyPI.
@@ -234,18 +223,11 @@ impl Project {
                 packages, crates, ..
             } => {
                 let first = &packages[0];
-                let errors: Vec<String> = packages[1..]
-                    .iter()
-                    .filter(|package| package.version != first.version)
-                    .map(|package| {
-                        format!(
-                            "{} is at {}, but {} is at {}. touchgate releases them at one version",
-                            package.name, package.version, first.name, first.version
-                        )
-                    })
-                    .collect();
-                if !errors.is_empty() {
-                    return Err(errors);
+                if let Some(other) = packages.iter().find(|p| p.version != first.version) {
+                    return Err(vec![format!(
+                        "{} is at {}, but {} is at {}. touchgate releases them at one version",
+                        other.name, other.version, first.name, first.version
+                    )]);
                 }
                 (&first.version, crates.as_ref())
             }
@@ -321,62 +303,15 @@ impl Project {
     }
 }
 
-/// Returns the directories of the uv workspace members that `members` lists,
-/// relative to `root`. A member is a directory, or a directory's every
-/// subdirectory with a `pyproject.toml`, as `<dir>/*` writes it.
-fn member_dirs(root: &Path, members: &[String]) -> Result<Vec<PathBuf>, Vec<String>> {
-    let mut dirs = Vec::new();
-    for member in members {
-        if let Some(parent) = member.strip_suffix("/*") {
-            if parent.contains(['*', '?', '[']) {
-                return Err(vec![unsupported_member(member)]);
-            }
-            let parent = root.join(parent);
-            let mut found: Vec<PathBuf> = std::fs::read_dir(&parent)
-                .map_err(|error| vec![format!("{}: {error}", parent.display())])?
-                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                .filter(|path| path.join("pyproject.toml").is_file())
-                .collect();
-            found.sort();
-            dirs.extend(found);
-        } else if member.contains(['*', '?', '[']) {
-            return Err(vec![unsupported_member(member)]);
-        } else {
-            dirs.push(root.join(member));
-        }
+/// Loads the uv workspace member `member`, a directory relative to `root`.
+fn load_member(root: &Path, member: &str) -> Result<PythonPackage, Vec<String>> {
+    if member.contains(['*', '?', '[']) {
+        return Err(vec![format!(
+            "pyproject.toml: touchgate reads each uv workspace member as a directory, not the \
+             pattern `{member}`"
+        )]);
     }
-    if dirs.is_empty() {
-        return Err(vec!["the uv workspace has no members".to_owned()]);
-    }
-    Ok(dirs)
-}
-
-fn unsupported_member(member: &str) -> String {
-    format!(
-        "pyproject.toml: touchgate reads a uv workspace member as a directory or `<dir>/*`, \
-         not `{member}`"
-    )
-}
-
-/// Returns `packages` with each after the packages among them that it
-/// requires, and otherwise in their order.
-fn upload_order(mut packages: Vec<PythonPackage>) -> Vec<PythonPackage> {
-    let mut ordered: Vec<PythonPackage> = Vec::with_capacity(packages.len());
-    while !packages.is_empty() {
-        let ready = packages
-            .iter()
-            .position(|package| {
-                package.requires.iter().all(|name| {
-                    !packages
-                        .iter()
-                        .any(|other| python::normalized_name(&other.name) == *name)
-                })
-            })
-            // A cycle cannot be resolved, so the rest keep their order.
-            .unwrap_or(0);
-        ordered.push(packages.remove(ready));
-    }
-    ordered
+    PythonPackage::load(&root.join(member))
 }
 
 /// Returns the top directory of the git repository the current directory is in.
@@ -428,36 +363,5 @@ mod tests {
             })
         );
         assert!(ReleaseKind::from_pyproject("[project").is_err());
-    }
-
-    fn package(name: &str, requires: &[&str]) -> PythonPackage {
-        let dir =
-            std::env::temp_dir().join(format!("touchgate-project-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dependencies: Vec<String> = requires.iter().map(|r| format!("{r:?}")).collect();
-        std::fs::write(
-            dir.join("pyproject.toml"),
-            format!(
-                "[project]\nname = \"{name}\"\nversion = \"0.1.0\"\ndependencies = [{}]\n",
-                dependencies.join(", ")
-            ),
-        )
-        .unwrap();
-        let package = PythonPackage::load(&dir).unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
-        package
-    }
-
-    #[test]
-    fn uploads_a_package_after_those_it_requires() {
-        let names = |packages: &[PythonPackage]| {
-            packages.iter().map(|p| p.name.clone()).collect::<Vec<_>>()
-        };
-        let ordered = upload_order(vec![
-            package("frc", &["numpy >= 2", "Frc_Core == 0.1.0"]),
-            package("frc-core", &[]),
-            package("other", &[]),
-        ]);
-        assert_eq!(names(&ordered), ["frc-core", "frc", "other"]);
     }
 }

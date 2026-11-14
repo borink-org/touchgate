@@ -30,9 +30,6 @@ const OIDC_REQUEST_URL: &str = "ACTIONS_ID_TOKEN_REQUEST_URL";
 pub struct PythonPackage {
     pub name: String,
     pub version: Version,
-    /// The names of the packages in `project.dependencies`, as
-    /// [`normalized_name`] writes them.
-    pub requires: Vec<String>,
     manifest: PathBuf,
 }
 
@@ -69,18 +66,9 @@ impl PythonPackage {
             .and_then(Item::as_str)
             .ok_or_else(|| error("no `project.version`"))?;
         let version = Version::parse(version).map_err(|message| error(&message))?;
-        let requires = project
-            .get("dependencies")
-            .and_then(Item::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|requirement| requirement.as_str())
-            .map(|requirement| normalized_name(requirement_name(requirement)))
-            .collect();
         Ok(Self {
             name: name.to_owned(),
             version,
-            requires,
             manifest,
         })
     }
@@ -121,20 +109,18 @@ impl PythonPackage {
             .get_mut("dependencies")
             .and_then(Item::as_array_mut)
         {
+            let siblings: Vec<String> = siblings.iter().map(|name| normalized_name(name)).collect();
             for requirement in dependencies.iter_mut() {
-                let bumped = requirement.as_str().and_then(|text| {
-                    let named = normalized_name(requirement_name(text));
-                    siblings
-                        .iter()
-                        .any(|sibling| normalized_name(sibling) == named)
-                        .then(|| bump_pinned_requirement(text, &self.version, new))
-                        .flatten()
-                });
-                if let Some(bumped) = bumped {
-                    let decor = requirement.decor().clone();
-                    *requirement = Value::from(bumped);
-                    *requirement.decor_mut() = decor;
-                }
+                let Some(bumped) = requirement
+                    .as_str()
+                    .filter(|text| siblings.contains(&normalized_name(requirement_name(text))))
+                    .and_then(|text| bump_pinned_requirement(text, &self.version, new))
+                else {
+                    continue;
+                };
+                let decor = requirement.decor().clone();
+                *requirement = Value::from(bumped);
+                *requirement.decor_mut() = decor;
             }
         }
         std::fs::write(&self.manifest, document.to_string())
@@ -274,7 +260,7 @@ pub fn publish_packages(packages: &[PythonPackage], dist: &Path) -> Result<(), V
 /// and sdists of `packages`: those of the first package, sorted, then those of
 /// the next. Fails if a file belongs to no package, or a package has no file.
 fn release_files(packages: &[PythonPackage], names: &[String]) -> Result<Vec<String>, Vec<String>> {
-    let mut by_package = vec![Vec::new(); packages.len()];
+    let mut files = Vec::new();
     let mut errors = Vec::new();
     for name in names {
         // `uv build` writes one, so that git leaves `dist` alone.
@@ -285,7 +271,7 @@ fn release_files(packages: &[PythonPackage], names: &[String]) -> Result<Vec<Str
             .iter()
             .position(|package| package.is_release_file(name))
         {
-            Some(index) => by_package[index].push(name.clone()),
+            Some(package) => files.push((package, name.clone())),
             None => errors.push(format!(
                 "{name} is not a wheel or the sdist of {}",
                 packages
@@ -296,8 +282,8 @@ fn release_files(packages: &[PythonPackage], names: &[String]) -> Result<Vec<Str
             )),
         }
     }
-    for (package, files) in packages.iter().zip(&by_package) {
-        if files.is_empty() {
+    for (index, package) in packages.iter().enumerate() {
+        if !files.iter().any(|(of, _)| *of == index) {
             errors.push(format!(
                 "there is nothing to publish of {} {}",
                 package.name, package.version
@@ -307,13 +293,8 @@ fn release_files(packages: &[PythonPackage], names: &[String]) -> Result<Vec<Str
     if !errors.is_empty() {
         return Err(errors);
     }
-    Ok(by_package
-        .into_iter()
-        .flat_map(|mut files| {
-            files.sort();
-            files
-        })
-        .collect())
+    files.sort();
+    Ok(files.into_iter().map(|(_, name)| name).collect())
 }
 
 /// Runs `uv lock` in `dir` if it has a `uv.lock`. The lock records the
@@ -338,32 +319,23 @@ fn requirement_name(requirement: &str) -> &str {
 
 /// Returns `name` normalized as PEP 503 compares names: lower case, with each
 /// run of `-`, `_` and `.` turned into one `-`.
-pub fn normalized_name(name: &str) -> String {
+fn normalized_name(name: &str) -> String {
     file_name_part(name).replace('_', "-")
 }
 
-/// Returns `requirement` with `new` in place of `old` if its version
-/// specifier is exactly `== old`, with or without spaces, before any
-/// environment marker. A wider specifier is left to hold or fail when uv
-/// locks the workspace.
+/// Returns `requirement` with `new` in place of `old` if it pins exactly
+/// `== old`, with or without spaces, before any environment marker. A wider
+/// specifier is left to hold or fail when uv locks the workspace.
 fn bump_pinned_requirement(requirement: &str, old: &Version, new: &Version) -> Option<String> {
-    let (specifier, marker) = match requirement.find(';') {
-        Some(at) => requirement.split_at(at),
-        None => (requirement, ""),
-    };
-    let name = requirement_name(specifier);
-    let start = specifier.find(name)? + name.len();
-    let pin = specifier[start..].trim();
-    let pinned = pin.strip_prefix("==")?.trim();
-    if pinned != old.to_string() {
+    let (specifier, marker) =
+        requirement.split_at(requirement.find(';').unwrap_or(requirement.len()));
+    let pin = specifier.trim_end();
+    let before = pin.strip_suffix(old.to_string().as_str())?;
+    let name = before.trim_end().strip_suffix("==")?.trim();
+    if name != requirement_name(name) {
         return None;
     }
-    let at = start + specifier[start..].rfind(pinned)?;
-    Some(format!(
-        "{}{new}{}{marker}",
-        &specifier[..at],
-        &specifier[at + pinned.len()..]
-    ))
+    Some(format!("{before}{new}{}{marker}", &specifier[pin.len()..]))
 }
 
 /// Returns the path where `pypi-attestations sign` writes the attestation of
@@ -400,7 +372,6 @@ mod tests {
         PythonPackage {
             name: name.to_owned(),
             version: Version::parse(version).unwrap(),
-            requires: Vec::new(),
             manifest: PathBuf::from("pyproject.toml"),
         }
     }
@@ -545,7 +516,6 @@ mod tests {
         )
         .unwrap();
         let package = PythonPackage::load(&dir).unwrap();
-        assert_eq!(package.requires, ["numpy", "frc-core"]);
         package
             .write_version(&Version::parse("0.2.0").unwrap(), &["frc", "frc_core"])
             .unwrap();

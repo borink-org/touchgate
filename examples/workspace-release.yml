@@ -142,7 +142,7 @@ jobs:
 
   # Builds nothing from the commit. touchgate checks that the built files are
   # those of the workspace's packages at this version, signs their
-  # attestations and uploads them, each package after those it requires.
+  # attestations and uploads them, in the order the workspace lists them.
   publish-pypi:
     name: Publish to PyPI
     needs: [verify, build, crates, checks]

@@ -101,9 +101,9 @@ A repository can release several Python packages and the crates they are built f
 members = ["python/frc-core", "python/frc"]
 ```
 
-touchgate releases every member to PyPI, and the published packages of the Cargo workspace at the root, if there is one, to crates.io. A member is a directory, or `<dir>/*` for each subdirectory with a `pyproject.toml`. `CHANGELOG.md` is at the root, and one version covers everything: every member and every package of the Cargo workspace, published or not, must be at it. `touchgate prepare` sets it on all of them, moves each requirement of a member on another member from `== <old version>` to `== <new version>`, and updates `Cargo.lock` and `uv.lock`.
+touchgate releases every member to PyPI, and the published packages of the Cargo workspace at the root, if there is one, to crates.io. touchgate reads each member as a directory, not a pattern, and uploads the members in the order they are listed, so list a member after those it requires. `CHANGELOG.md` is at the root, and one version covers everything: every member and every package of the Cargo workspace, published or not, must be at it. `touchgate prepare` sets it on all of them, moves each requirement of a member on another member from `== <old version>` to `== <new version>`, and updates `Cargo.lock` and `uv.lock`.
 
-[`examples/workspace-release.yml`](examples/workspace-release.yml) publishes from two jobs: `touchgate publish --to crates.io` runs `cargo publish` as for a Cargo workspace, and `touchgate publish --to pypi dist` checks that `dist` holds files of every member at this version and nothing else, and uploads them, each member after the members it requires. One trusted publisher on PyPI per member, and one on crates.io per published crate, all for `release.yml` in the `release` environment, let both jobs publish.
+[`examples/workspace-release.yml`](examples/workspace-release.yml) publishes from two jobs: `touchgate publish --to crates.io` runs `cargo publish` as for a Cargo workspace, and `touchgate publish --to pypi dist` checks that `dist` holds files of every member at this version and nothing else, and uploads them in that order. One trusted publisher on PyPI per member, and one on crates.io per published crate, all for `release.yml` in the `release` environment, let both jobs publish.
 
 ## touchgate's own releases
 

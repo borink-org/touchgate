@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use changelog::Changelog;
-use project::Project;
+use project::{Project, Registry};
 use version::{Date, Version};
 use workspace::Workspace;
 
@@ -565,36 +565,33 @@ fn publish(args: &[&str]) -> Result<(), Vec<String>> {
     let project = Project::load()?;
     project.version()?;
     let registries = project.registries();
-    let (registry, args) = match args {
-        ["--to", registry, rest @ ..] => {
-            let registry = project::Registry::parse(registry).map_err(|error| vec![error])?;
-            if !registries.contains(&registry) {
-                return Err(vec![format!(
-                    "the project publishes nothing to {}",
-                    registry.name()
-                )]);
-            }
-            (registry, rest)
+    let (registry, args) = match (args, registries.as_slice()) {
+        (["--to", name, rest @ ..], _) => {
+            (Registry::parse(name).map_err(|error| vec![error])?, rest)
         }
-        _ => match registries.as_slice() {
-            [registry] => (*registry, args),
-            _ => {
-                return Err(vec![
-                    "the project publishes to crates.io and PyPI. Name one with \
-                     `--to crates.io` or `--to pypi`"
-                        .to_owned(),
-                ]);
-            }
-        },
+        (_, [registry]) => (*registry, args),
+        _ => {
+            return Err(vec![
+                "the project publishes to crates.io and PyPI. Name one with \
+                 `--to crates.io` or `--to pypi`"
+                    .to_owned(),
+            ]);
+        }
     };
+    if !registries.contains(&registry) {
+        return Err(vec![format!(
+            "the project publishes nothing to {}",
+            registry.name()
+        )]);
+    }
     match registry {
-        project::Registry::CratesIo => {
+        Registry::CratesIo => {
             let workspace = project
                 .published_crates()
                 .expect("a project that publishes to crates.io has crates");
             publish_crates(workspace, args)
         }
-        project::Registry::PyPi => {
+        Registry::PyPi => {
             let dist = match args {
                 [] => "dist",
                 [dist] => dist,
