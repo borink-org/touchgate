@@ -418,8 +418,14 @@ impl Screen {
 
     /// Changes the screen for the key `pressed` on a screen of `rows`, and
     /// returns what else the key asks for.
+    ///
+    /// The keys follow vim: `j` and `k` move down and up, `h` and `l` left
+    /// and right, `g` and `G` to the top and the bottom, and Ctrl with `d`
+    /// and `u` by half a page, with `f` and `b` by a page. The arrow and
+    /// paging keys work too. Esc does nothing, since a vim user presses it out
+    /// of habit.
     fn respond(&mut self, pressed: Key, rows: usize) -> Response {
-        if matches!(pressed, Key::Char('q') | Key::Escape | Key::Ctrl('c')) {
+        if matches!(pressed, Key::Char('q') | Key::Ctrl('c')) {
             return Response::Quit;
         }
         match &mut self.stage {
@@ -429,39 +435,46 @@ impl Screen {
             },
             Stage::Preparing(preparing) => {
                 let last = preparing.choices.len() - 1;
+                let selected = preparing.selected;
+                preparing.selected = match pressed {
+                    Key::Char('k') | Key::Up => selected.saturating_sub(1),
+                    Key::Char('j') | Key::Down => (selected + 1).min(last),
+                    Key::Char('g') | Key::Home => 0,
+                    Key::Char('G') | Key::End => last,
+                    _ => selected,
+                };
+                preparing.landing = match pressed {
+                    Key::Char('h') | Key::Left => Landing::Push,
+                    Key::Char('l') | Key::Right => Landing::PullRequest,
+                    Key::Tab => match preparing.landing {
+                        Landing::Push => Landing::PullRequest,
+                        Landing::PullRequest => Landing::Push,
+                    },
+                    _ => preparing.landing,
+                };
                 match pressed {
-                    Key::Up | Key::Char('k') => {
-                        preparing.selected = preparing.selected.saturating_sub(1)
-                    }
-                    Key::Down | Key::Char('j') => {
-                        preparing.selected = (preparing.selected + 1).min(last)
-                    }
-                    Key::Char('l') | Key::Tab => {
-                        preparing.landing = match preparing.landing {
-                            Landing::Push => Landing::PullRequest,
-                            Landing::PullRequest => Landing::Push,
-                        }
-                    }
-                    Key::Enter => return Response::Prepare,
-                    Key::Char('r') => return Response::Inspect,
-                    _ => {}
+                    Key::Enter => Response::Prepare,
+                    Key::Char('r') => Response::Inspect,
+                    _ => Response::Nothing,
                 }
-                Response::Nothing
             }
             Stage::Reviewing(reviewing) => {
                 let page = rows.saturating_sub(REVIEW_CHROME).max(1);
+                let half = page.div_ceil(2);
                 let last = reviewing.changes.log.lines().count().saturating_sub(page);
                 let scroll = reviewing.scroll;
                 reviewing.scroll = match pressed {
                     Key::Char('a') | Key::Enter => return Response::Approve,
                     Key::Char('p') if reviewing.stale_date => return Response::PrepareAgain,
                     Key::Char('r') => return Response::Inspect,
-                    Key::Up | Key::Char('k') => scroll.saturating_sub(1),
-                    Key::Down | Key::Char('j') => scroll + 1,
-                    Key::PageUp => scroll.saturating_sub(page),
-                    Key::PageDown | Key::Char(' ') => scroll + page,
-                    Key::Home => 0,
-                    Key::End => last,
+                    Key::Char('k') | Key::Up => scroll.saturating_sub(1),
+                    Key::Char('j') | Key::Down => scroll + 1,
+                    Key::Ctrl('u') => scroll.saturating_sub(half),
+                    Key::Ctrl('d') => scroll + half,
+                    Key::Ctrl('b') | Key::PageUp => scroll.saturating_sub(page),
+                    Key::Ctrl('f') | Key::PageDown | Key::Char(' ') => scroll + page,
+                    Key::Char('g') | Key::Home => 0,
+                    Key::Char('G') | Key::End => last,
                     _ => scroll,
                 }
                 .min(last);
@@ -941,32 +954,34 @@ fn preparing_lines(
         lines.push(line);
     }
     let version = &preparing.choices[preparing.selected].version;
-    lines.push(vec![
-        Span::plain("Lands by  "),
-        Span::styled(
-            match preparing.landing {
-                Landing::Push => format!("a push to {default}"),
-                Landing::PullRequest => {
-                    format!("a pull request from {}", github::release_branch(version))
-                }
-            },
-            Style::Bold,
+    let mut landing = vec![Span::plain("Lands by  ")];
+    for (each, text) in [
+        (Landing::Push, format!("a push to {default}")),
+        (
+            Landing::PullRequest,
+            format!("a pull request from {}", github::release_branch(version)),
         ),
-    ]);
+    ] {
+        if each == preparing.landing {
+            landing.push(Span::styled("● ", Style::Accent));
+            landing.push(Span::styled(text, Style::Bold));
+        } else {
+            landing.push(Span::styled("○ ", Style::Dim));
+            landing.push(Span::plain(text));
+        }
+        landing.push(Span::plain("   "));
+    }
+    lines.push(landing);
     lines.push(vec![]);
     if let Some(notice) = &preparing.notice {
         push_wrapped(lines, notice, Style::Failed, columns);
     }
     let action = format!("prepare {version}");
-    let other = match preparing.landing {
-        Landing::Push => "pull request instead",
-        Landing::PullRequest => "push instead",
-    };
     let mut keys = vec![("enter", action.as_str())];
     if preparing.choices.len() > 1 {
-        keys.push(("↑↓", "version"));
+        keys.push(("j/k", "version"));
     }
-    keys.extend([("l", other), ("q", "quit")]);
+    keys.extend([("h/l", "push or pull request"), ("q", "quit")]);
     lines.push(footer(&keys));
 }
 
@@ -1083,7 +1098,7 @@ fn reviewing_lines(lines: &mut Vec<Line>, reviewing: &Reviewing, columns: usize,
         keys.push(("p", "date anew"));
     }
     if count > page {
-        keys.push(("↑↓", scroll.as_str()));
+        keys.push(("j/k", scroll.as_str()));
     }
     keys.push(("q", "quit"));
     lines.push(footer(&keys));
@@ -1183,6 +1198,99 @@ mod tests {
         let lines: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
         let (choices, suggested) = version_choices(&current, &lines);
         choices[suggested].version.to_string()
+    }
+
+    /// Returns a screen at `stage` for a repository that releases from main.
+    fn screen_at(stage: Stage) -> Screen {
+        Screen {
+            repository: Repository {
+                name: "o/r".to_owned(),
+                default_branch: "main".to_owned(),
+            },
+            key: PathBuf::from("key"),
+            stage,
+            tick: 0,
+            notifications: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn picks_a_version_and_a_landing_with_vim_keys() {
+        let current = Version::parse("0.2.0").unwrap();
+        let (choices, suggested) = version_choices(&current, &[]);
+        let mut screen = screen_at(Stage::Preparing(Preparing {
+            unreleased: Vec::new(),
+            choices,
+            selected: suggested,
+            suggested,
+            landing: Landing::Push,
+            notice: None,
+        }));
+        let mut press = |key| {
+            let response = screen.respond(key, 24);
+            let Stage::Preparing(preparing) = &screen.stage else {
+                panic!("the screen left the preparation");
+            };
+            let version = preparing.choices[preparing.selected].version.to_string();
+            (version, preparing.landing, response)
+        };
+        assert!(
+            matches!(press(Key::Char('j')), (v, Landing::Push, Response::Nothing) if v == "0.3.0")
+        );
+        assert!(matches!(press(Key::Char('G')), (v, _, _) if v == "1.0.0"));
+        assert!(matches!(press(Key::Char('j')), (v, _, _) if v == "1.0.0"));
+        assert!(matches!(press(Key::Char('g')), (v, _, _) if v == "0.2.1"));
+        assert!(matches!(
+            press(Key::Char('l')),
+            (_, Landing::PullRequest, _)
+        ));
+        assert!(matches!(
+            press(Key::Char('l')),
+            (_, Landing::PullRequest, _)
+        ));
+        assert!(matches!(press(Key::Char('h')), (_, Landing::Push, _)));
+        assert!(matches!(press(Key::Escape), (_, _, Response::Nothing)));
+        assert!(matches!(press(Key::Enter), (_, _, Response::Prepare)));
+        assert!(matches!(press(Key::Char('q')), (_, _, Response::Quit)));
+    }
+
+    #[test]
+    fn scrolls_the_commits_with_vim_keys() {
+        let log: String = (0..40).map(|n| format!("{n:07x} Commit {n}.\n")).collect();
+        let mut screen = screen_at(Stage::Reviewing(Reviewing {
+            plan: ReleasePlan {
+                repository: "o/r".to_owned(),
+                commit: "c".repeat(40),
+                version: Version::parse("0.3.0").unwrap(),
+                date: Date::parse("2026-11-14").unwrap(),
+                workflow_commit: "w".repeat(40),
+            },
+            changes: Changes {
+                previous: None,
+                log,
+                shortstat: String::new(),
+            },
+            scroll: 0,
+            stale_date: false,
+            notice: None,
+        }));
+        // 24 rows leave a page of 13 commits, so the last page starts at 27.
+        let mut press = |key| {
+            screen.respond(key, 24);
+            let Stage::Reviewing(reviewing) = &screen.stage else {
+                panic!("the screen left the review");
+            };
+            reviewing.scroll
+        };
+        assert_eq!(press(Key::Char('j')), 1);
+        assert_eq!(press(Key::Ctrl('d')), 8);
+        assert_eq!(press(Key::Ctrl('f')), 21);
+        assert_eq!(press(Key::Ctrl('f')), 27);
+        assert_eq!(press(Key::Ctrl('u')), 20);
+        assert_eq!(press(Key::Ctrl('b')), 7);
+        assert_eq!(press(Key::Char('G')), 27);
+        assert_eq!(press(Key::Char('g')), 0);
+        assert_eq!(press(Key::Char('k')), 0);
     }
 
     #[test]

@@ -555,6 +555,22 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_vim_keys_both_ways() {
+        let expected = [
+            Key::Char('G'),
+            Key::Ctrl('d'),
+            Key::Ctrl('u'),
+            Key::Ctrl('f'),
+            Key::Ctrl('b'),
+        ];
+        assert_eq!(keys(b"G\x04\x15\x06\x02"), expected);
+        assert_eq!(
+            keys(b"G\x1b[100;5u\x1b[117;5u\x1b[102;5u\x1b[98;5u"),
+            expected
+        );
+    }
+
+    #[test]
     fn leaves_unfinished_keys_for_the_next_read() {
         assert_eq!(parse_keys(b"a\x1b"), (vec![Key::Char('a')], 1));
         assert_eq!(parse_keys(b"a\x1b[1;5"), (vec![Key::Char('a')], 1));
