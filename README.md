@@ -2,7 +2,7 @@
 
 **EXPERIMENTAL: Still playing around, do not depend on its security!**
 
-touchgate releases a Cargo workspace to crates.io, or a Python package to PyPI, from a hand-written `CHANGELOG.md`. CI publishes a release only after you approve it with a FIDO2 security key, by touch and PIN. Anything that holds your GitHub token, such as a coding agent, cannot publish on its own.
+touchgate releases a Cargo workspace to crates.io, a Python package to PyPI, or the Python packages of a uv workspace together with the Cargo workspace beside them, from a hand-written `CHANGELOG.md`. CI publishes a release only after you approve it with a FIDO2 security key, by touch and PIN. Anything that holds your GitHub token, such as a coding agent, cannot publish on its own.
 
 ## Releasing
 
@@ -36,7 +36,7 @@ If a release fails, re-run its failed jobs from GitHub Actions. Re-running every
    `touchgate approve` also needs `gh`, logged in to an account that can start workflows in the repository.
 
 2. Copy [`examples/touchgate.yml`](examples/touchgate.yml) to `.github/workflows/touchgate.yml` on your default branch. It checks the changelog, and prepares a release through a pull request when you start it with a version.
-3. Copy [`examples/crates-release.yml`](examples/crates-release.yml) to `.github/workflows/release.yml`. For a Python package, copy [`examples/pypi-release.yml`](examples/pypi-release.yml) instead. Set `TOUCHGATE_KEY` in it to the contents of your `.pub` file.
+3. Copy [`examples/crates-release.yml`](examples/crates-release.yml) to `.github/workflows/release.yml`. For a Python package, copy [`examples/pypi-release.yml`](examples/pypi-release.yml) instead, and for [several packages](#several-packages-in-one-repository), [`examples/workspace-release.yml`](examples/workspace-release.yml). Set `TOUCHGATE_KEY` in it to the contents of your `.pub` file.
 4. In both files, replace the commit in `borink-org/touchgate/install@<commit>` with the commit of a touchgate release. The release's tag on GitHub names that commit.
 5. Commit both files to the default branch, and copy `release.yml` to a `publish` branch.
 6. With the admin account, make the settings in [Settings](#settings).
@@ -49,7 +49,7 @@ Your everyday account has Maintain on the repository, not Admin. A separate admi
 
 - A ruleset that lets only the admin create, update or delete the `publish` branch, and that blocks force pushes.
 - A `release` environment that admits only the `publish` branch.
-- A trusted publisher on crates.io or PyPI for `release.yml` in the `release` environment. Delete every API token for the package.
+- A trusted publisher on crates.io or PyPI for `release.yml` in the `release` environment, for every package the repository publishes. Delete every API token for them.
 - Immutable releases.
 - GitHub Actions allowed to create pull requests, if you prepare releases with the `touchgate` workflow.
 - A `no-changelog` label, for pull requests that need no changelog entry.
@@ -91,6 +91,19 @@ touchgate reads and sets `project.version` in `pyproject.toml`, and updates `uv.
 touchgate installs `pypi-attestations` from a lock in its own source, which fixes each dependency by the hashes of its files. A new touchgate release can update that lock.
 
 The example builds with `uv build`. For maturin, build the wheels in the `build` job with [PyO3/maturin-action](https://github.com/PyO3/maturin-action) in a matrix, and download them all into `dist`.
+
+## Several packages in one repository
+
+A repository can release several Python packages and the crates they are built from at one version, such as a Rust library on crates.io, its Python bindings on PyPI, and a pure Python package on top. The root `pyproject.toml` then has no `[project]` and lists the packages as members of a uv workspace:
+
+```toml
+[tool.uv.workspace]
+members = ["python/frc-core", "python/frc"]
+```
+
+touchgate releases every member to PyPI, and the published packages of the Cargo workspace at the root, if there is one, to crates.io. touchgate reads each member as a directory, not a pattern, and uploads the members in the order they are listed, so list a member after those it requires. `CHANGELOG.md` is at the root, and one version covers everything: every member and every package of the Cargo workspace, published or not, must be at it. `touchgate prepare` sets it on all of them, moves each requirement of a member on another member from `== <old version>` to `== <new version>`, and updates `Cargo.lock` and `uv.lock`.
+
+[`examples/workspace-release.yml`](examples/workspace-release.yml) publishes from two jobs: `touchgate publish --to crates.io` runs `cargo publish` as for a Cargo workspace, and `touchgate publish --to pypi dist` checks that `dist` holds files of every member at this version and nothing else, and uploads them in that order. One trusted publisher on PyPI per member, and one on crates.io per published crate, all for `release.yml` in the `release` environment, let both jobs publish.
 
 ## touchgate's own releases
 

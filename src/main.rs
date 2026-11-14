@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use changelog::Changelog;
-use project::Project;
+use project::{Project, Registry};
 use version::{Date, Version};
 use workspace::Workspace;
 
@@ -39,7 +39,8 @@ usage:
   touchgate verify [--repo <dir>] [--approval <file>] [--branch <ref>]
                    [--repository <owner/name>] [--key <public key>]
                    [--workflow-commit <hash>] [--max-age <15m | 1h | 7d>]
-  touchgate publish [<cargo publish arguments>... | <directory of built files>]
+  touchgate publish [--to crates.io] [<cargo publish arguments>...]
+  touchgate publish [--to pypi] [<directory of built files>]
   touchgate github-release [--commit <hash>] [<file to attach>...]
   touchgate wait-for-checks [--commit <hash>] [--timeout <30m | 2h>]
 
@@ -96,14 +97,15 @@ fn check() -> Result<Version, Vec<String>> {
     }
 }
 
-/// Does what [`check`] does, before a release is built. For a Python package,
-/// also checks that `uv build` builds it with the copy of `uv_build` in the
-/// uv on the `PATH`, as [`PythonPackage::check_build_backend`] describes.
+/// Does what [`check`] does, before a release is built. For each Python
+/// package, also checks that `uv build` builds it with the copy of `uv_build`
+/// in the uv on the `PATH`, as [`PythonPackage::check_build_backend`]
+/// describes.
 ///
 /// [`PythonPackage::check_build_backend`]: python::PythonPackage::check_build_backend
 fn check_build() -> Result<(), Vec<String>> {
     let version = check()?;
-    if let Project::Python { package, .. } = Project::load()? {
+    for package in Project::load()?.python_packages() {
         println!("{}", package.check_build_backend()?);
     }
     println!("{version}");
@@ -175,7 +177,7 @@ fn prepare(version: &str, args: &[&str]) -> Result<(), Vec<String>> {
             &version,
             preparation,
             &changelog_in_repository(&project)?,
-            project.registry(),
+            &project.registries(),
         )
         .map_err(|error| vec![error])?;
     }
@@ -552,23 +554,50 @@ fn show_changes(commit: &str) -> Result<(), Vec<String>> {
     Ok(())
 }
 
-/// Publishes what the project releases to its registry, skipping what is
-/// there already, so that a release that failed halfway can run again.
+/// Publishes what the project releases to a registry, skipping what is there
+/// already, so that a release that failed halfway can run again. A project
+/// that publishes to both crates.io and PyPI publishes to each in its own
+/// job, so `--to` must name the registry; otherwise it may.
 ///
-/// To crates.io, `args` go to `cargo publish`. To PyPI, `args` is the
-/// directory of the built files, `dist` unless it names another.
+/// To crates.io, the other `args` go to `cargo publish`. To PyPI, they are
+/// the directory of the built files, `dist` unless they name another.
 fn publish(args: &[&str]) -> Result<(), Vec<String>> {
     let project = Project::load()?;
     project.version()?;
-    match &project {
-        Project::Crates(workspace) => publish_crates(workspace, args),
-        Project::Python { package, .. } => {
+    let registries = project.registries();
+    let (registry, args) = match (args, registries.as_slice()) {
+        (["--to", name, rest @ ..], _) => {
+            (Registry::parse(name).map_err(|error| vec![error])?, rest)
+        }
+        (_, [registry]) => (*registry, args),
+        _ => {
+            return Err(vec![
+                "the project publishes to crates.io and PyPI. Name one with \
+                 `--to crates.io` or `--to pypi`"
+                    .to_owned(),
+            ]);
+        }
+    };
+    if !registries.contains(&registry) {
+        return Err(vec![format!(
+            "the project publishes nothing to {}",
+            registry.name()
+        )]);
+    }
+    match registry {
+        Registry::CratesIo => {
+            let workspace = project
+                .published_crates()
+                .expect("a project that publishes to crates.io has crates");
+            publish_crates(workspace, args)
+        }
+        Registry::PyPi => {
             let dist = match args {
                 [] => "dist",
                 [dist] => dist,
                 _ => return Err(vec![USAGE.to_owned()]),
             };
-            package.publish(Path::new(dist))
+            python::publish_packages(project.python_packages(), Path::new(dist))
         }
     }
 }

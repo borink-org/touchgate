@@ -140,13 +140,13 @@ impl GitHubRelease {
 
 /// Commits the prepared release on its branch, pushes it, and opens a pull
 /// request for it, or updates the one that is open. `changelog` is the
-/// changelog's path in the repository, and `registry` where the release
+/// changelog's path in the repository, and `registries` where the release
 /// publishes to.
 pub fn pull_request(
     version: &Version,
     preparation: Preparation,
     changelog: &str,
-    registry: Registry,
+    registries: &[Registry],
 ) -> Result<(), String> {
     let release = GitHubRelease::of(version, changelog)?;
     if git(&["status", "--porcelain"])?.is_empty() {
@@ -184,7 +184,11 @@ touchgate approve
 
 {preview}",
         preview = release.preview(),
-        registry = registry.name()
+        registry = registries
+            .iter()
+            .map(|registry| registry.name())
+            .collect::<Vec<_>>()
+            .join(" and ")
     );
     let title = preparation.commit_message(version);
     match gh(&[
