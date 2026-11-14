@@ -285,11 +285,20 @@ impl<'a> Changelog<'a> {
 /// headings. This reads any text, since the base of a pull request may predate
 /// the rules that [`Changelog::parse`] enforces.
 pub fn unreleased_entries(text: &str) -> Vec<&str> {
+    unreleased_lines(text)
+        .into_iter()
+        .filter(|line| !line.starts_with('#'))
+        .collect()
+}
+
+/// Returns the lines under `## Unreleased` that are not blank: the entries
+/// and the headings of their groups, such as `### Added`.
+pub fn unreleased_lines(text: &str) -> Vec<&str> {
     text.lines()
         .skip_while(|line| *line != "## Unreleased")
         .skip(1)
         .take_while(|line| !line.starts_with("## "))
-        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .filter(|line| !line.trim().is_empty())
         .collect()
 }
 

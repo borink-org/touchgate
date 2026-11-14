@@ -10,7 +10,7 @@ use std::io::Write;
 use std::sync::{Once, OnceLock};
 
 use rustix::termios::{self, OptionalActions, SpecialCodeIndex, Termios};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Switches to the alternate screen, hides the cursor and asks for the kitty
 /// keyboard protocol with escape codes disambiguated.
@@ -111,6 +111,8 @@ pub enum TabProgress {
     Hidden,
     /// Under way, for an unknown time.
     Busy,
+    /// Waiting for the person to do something.
+    WaitingOnYou,
     Failed,
 }
 
@@ -120,6 +122,7 @@ impl TabProgress {
         match self {
             Self::Hidden => "\x1b]9;4;0\x1b\\",
             Self::Busy => "\x1b]9;4;3\x1b\\",
+            Self::WaitingOnYou => "\x1b]9;4;4;100\x1b\\",
             Self::Failed => "\x1b]9;4;2;100\x1b\\",
         }
     }
@@ -237,6 +240,36 @@ impl RawTerminal {
     }
 }
 
+impl RawTerminal {
+    /// Asks the terminal to show a desktop notification with `title` and
+    /// `body`, through OSC 777. Ghostty shows it.
+    pub fn notify(&mut self, title: &str, body: &str) -> Result<(), String> {
+        write_out(&notification(title, body))
+    }
+}
+
+/// Returns the OSC 777 sequence of a notification. Control characters would
+/// end the sequence, and a `;` in the title would end the title, so both
+/// become spaces.
+fn notification(title: &str, body: &str) -> String {
+    let clean = |text: &str, also: &[char]| -> String {
+        text.chars()
+            .map(|c| {
+                if c.is_control() || also.contains(&c) {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect()
+    };
+    format!(
+        "\x1b]777;notify;{};{}\x1b\\",
+        clean(title, &[';']),
+        clean(body, &[])
+    )
+}
+
 impl Drop for RawTerminal {
     fn drop(&mut self) {
         self.deactivate();
@@ -315,6 +348,26 @@ fn cut_to_width(text: &str, columns: usize) -> (&str, usize) {
         width = next;
     }
     (text, width)
+}
+
+/// Returns `text` broken into lines at most `columns` wide, at spaces. A word
+/// wider than `columns` gets a line of its own, which drawing cuts.
+pub fn wrap_to_width(text: &str, columns: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.width() + 1 + word.width() > columns {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Reads the keys at the start of `bytes`, and returns them with the number
@@ -512,6 +565,23 @@ mod tests {
     fn skips_keys_it_does_not_name() {
         // F5, and the kitty code of a key from the private use area.
         assert_eq!(keys(b"\x1b[15~\x1b[57399ua"), [Key::Char('a')]);
+    }
+
+    #[test]
+    fn writes_notifications_that_end_where_they_should() {
+        assert_eq!(
+            notification("a;b", "line\none; two\x1b"),
+            "\x1b]777;notify;a b;line one; two \x1b\\"
+        );
+    }
+
+    #[test]
+    fn wraps_text_at_spaces() {
+        assert_eq!(
+            wrap_to_width("one two three  four", 9),
+            ["one two", "three", "four"]
+        );
+        assert_eq!(wrap_to_width("unbreakable a", 4), ["unbreakable", "a"]);
     }
 
     #[test]

@@ -70,6 +70,61 @@ impl Version {
     }
 }
 
+#[cfg(feature = "tui")]
+impl Version {
+    /// Returns the release that raises `part` of this version and resets the
+    /// parts after it, such as 0.3.0 for a minor release after 0.2.1.
+    pub fn raised(&self, part: VersionPart) -> Self {
+        let (major, minor, patch) = match part {
+            VersionPart::Major => (self.major + 1, 0, 0),
+            VersionPart::Minor => (self.major, self.minor + 1, 0),
+            VersionPart::Patch => (self.major, self.minor, self.patch + 1),
+        };
+        Self {
+            major,
+            minor,
+            patch,
+            pre: Vec::new(),
+        }
+    }
+
+    /// Returns the release that a pre-release leads to, such as 1.0.0 for
+    /// 1.0.0-rc.1. Returns `None` for a release.
+    pub fn final_release(&self) -> Option<Self> {
+        self.is_pre_release().then(|| Self {
+            pre: Vec::new(),
+            ..self.clone()
+        })
+    }
+
+    /// Whether a change that breaks compatibility raises the major part of
+    /// this version. Before 1.0.0, it raises the minor part instead.
+    pub fn is_stable(&self) -> bool {
+        self.major > 0
+    }
+}
+
+/// A part of a version that a release raises.
+#[cfg(feature = "tui")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VersionPart {
+    Major,
+    Minor,
+    Patch,
+}
+
+#[cfg(feature = "tui")]
+impl VersionPart {
+    /// Returns the name of the part, as a release that raises it is called.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Major => "major",
+            Self::Minor => "minor",
+            Self::Patch => "patch",
+        }
+    }
+}
+
 /// Parses a decimal number without leading zeros.
 fn number(text: &str) -> Option<u64> {
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {

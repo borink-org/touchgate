@@ -13,10 +13,10 @@ mod interactive;
 mod project;
 mod python;
 #[cfg(feature = "tui")]
-mod release_run;
-#[cfg(feature = "tui")]
 mod terminal;
 mod version;
+#[cfg(feature = "tui")]
+mod watch;
 mod workspace;
 
 use std::path::{Path, PathBuf};
@@ -42,7 +42,7 @@ usage:
   touchgate check-entry <base revision>
   touchgate notes [<version>]
   touchgate approve [<commit>] [--key <private key>] [--no-start]
-  touchgate release [<commit>] [--key <private key>]
+  touchgate [--key <private key>]
   touchgate verify [--repo <dir>] [--approval <file>] [--branch <ref>]
                    [--repository <owner/name>] [--key <public key>]
                    [--workflow-commit <hash>] [--max-age <15m | 1h | 7d>]
@@ -56,8 +56,8 @@ from the run's `approval` input. verify takes --branch and --repository from
 the run, --key from TOUCHGATE_KEY and --workflow-commit from
 GITHUB_WORKFLOW_SHA.
 
-touchgate release approves in the terminal and follows the release run. It
-is experimental, and only in a build with `--features tui`.";
+touchgate without a command prepares, approves and follows a release in the
+terminal. It is experimental, and only in a build with `--features tui`.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -73,7 +73,9 @@ fn main() -> ExitCode {
         ["publish", rest @ ..] => publish(rest),
         ["approve", rest @ ..] => approve(rest),
         #[cfg(feature = "tui")]
-        ["release", rest @ ..] => interactive::release(rest),
+        [] => interactive::release(None),
+        #[cfg(feature = "tui")]
+        ["--key", key] => interactive::release(Some(key)),
         ["github-release", "--commit", commit, files @ ..] => github_release(commit, files),
         ["github-release", files @ ..] => github_release_of_run(files),
         ["wait-for-checks", rest @ ..] => wait_for_checks(rest),
@@ -151,7 +153,38 @@ fn prepare(version: &str, args: &[&str]) -> Result<(), Vec<String>> {
             _ => return Err(vec![USAGE.to_owned()]),
         }
     }
-    let date = date.unwrap_or_else(Date::today);
+    let prepared = prepare_release(version, date.unwrap_or_else(Date::today))?;
+    println!("{}", prepared.version);
+    if pull_request {
+        let project = Project::load()?;
+        let outcome = github::pull_request(
+            &prepared.version,
+            prepared.preparation,
+            &changelog_in_repository(&project)?,
+            &project.registries(),
+            github::CommitAuthor::ActionsBot,
+        )
+        .map_err(|error| vec![error])?;
+        match outcome {
+            github::PullRequestOutcome::NoChange => println!(
+                "{} needs no change: approve the default branch with `touchgate approve`",
+                prepared.version
+            ),
+            github::PullRequestOutcome::Opened(url) => println!("{url}"),
+            github::PullRequestOutcome::Updated(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// A version that [`prepare_release`] prepared, and how.
+struct PreparedRelease {
+    version: Version,
+    preparation: github::Preparation,
+}
+
+/// Does what [`prepare`] does to the checkout, without committing it.
+fn prepare_release(version: Version, date: Date) -> Result<PreparedRelease, Vec<String>> {
     let current = check()?;
     let project = Project::load()?;
     let path = changelog_path(&project);
@@ -183,17 +216,10 @@ fn prepare(version: &str, args: &[&str]) -> Result<(), Vec<String>> {
     };
     let checked = check()?;
     assert_eq!(checked, version);
-    println!("{version}");
-    if pull_request {
-        github::pull_request(
-            &version,
-            preparation,
-            &changelog_in_repository(&project)?,
-            &project.registries(),
-        )
-        .map_err(|error| vec![error])?;
-    }
-    Ok(())
+    Ok(PreparedRelease {
+        version,
+        preparation,
+    })
 }
 
 /// Tags the release at `commit`, the checkout, and makes its GitHub release
@@ -459,7 +485,9 @@ fn approve(args: &[&str]) -> Result<(), Vec<String>> {
         }
     }
     let key = signing_key(key)?;
-    let plan = ReleasePlan::of(revision)?;
+    let repository = github::Repository::of_checkout().map_err(|error| vec![error])?;
+    fetch_release_refs(&repository)?;
+    let plan = ReleasePlan::of(repository, revision)?;
     let approval = plan.approval_at(unix_time()?)?;
 
     show_changes(&Changes::since_release(&approval.commit)?, &approval.commit);
@@ -503,6 +531,7 @@ fn signing_key(key: &str) -> Result<PathBuf, Vec<String>> {
 
 /// What an approval would release, before it is signed: everything an
 /// [`approval::Approval`] names but the time.
+#[derive(Clone)]
 struct ReleasePlan {
     /// The repository as `owner/name`.
     repository: String,
@@ -516,23 +545,11 @@ struct ReleasePlan {
 }
 
 impl ReleasePlan {
-    /// Fetches the default branch and `publish`, and reads the release of
-    /// `revision`, the tip of the default branch unless it names another
-    /// commit on it.
-    fn of(revision: Option<&str>) -> Result<Self, Vec<String>> {
-        let repository = github::Repository::of_checkout().map_err(|error| vec![error])?;
-        let default = &repository.default_branch;
-        let tracking = format!("refs/remotes/origin/{default}");
-        // The release is to run from publish as it is now; a change to it after
-        // this stops the release until it is approved again.
-        run(Command::new("git").args([
-            "fetch",
-            "--quiet",
-            "--tags",
-            "origin",
-            &format!("+refs/heads/{default}:{tracking}"),
-            "+refs/heads/publish:refs/remotes/origin/publish",
-        ]))?;
+    /// Reads the release of `revision` in `repository`, the tip of the
+    /// default branch unless it names another commit on it, as
+    /// [`fetch_release_refs`] fetched it.
+    fn of(repository: github::Repository, revision: Option<&str>) -> Result<Self, Vec<String>> {
+        let tracking = tracking_ref(&repository);
         let commit = run(Command::new("git").args([
             "rev-parse",
             "--verify",
@@ -570,6 +587,31 @@ impl ReleasePlan {
             time,
         })
     }
+}
+
+/// Fetches the default branch of `repository`, `publish` and the tags from
+/// origin.
+fn fetch_release_refs(repository: &github::Repository) -> Result<(), Vec<String>> {
+    // The release is to run from publish as it is now; a change to it after
+    // this stops the release until it is approved again.
+    run(Command::new("git").args([
+        "fetch",
+        "--quiet",
+        "--tags",
+        "origin",
+        &format!(
+            "+refs/heads/{}:{}",
+            repository.default_branch,
+            tracking_ref(repository)
+        ),
+        "+refs/heads/publish:refs/remotes/origin/publish",
+    ]))?;
+    Ok(())
+}
+
+/// Returns the ref that tracks the default branch of `repository` on origin.
+fn tracking_ref(repository: &github::Repository) -> String {
+    format!("refs/remotes/origin/{}", repository.default_branch)
 }
 
 /// Returns the time in seconds since the Unix epoch.

@@ -31,7 +31,7 @@ impl Preparation {
 }
 
 /// Returns the tag of the release of `version`.
-fn release_tag(version: &Version) -> String {
+pub fn release_tag(version: &Version) -> String {
     format!("v{version}")
 }
 
@@ -42,7 +42,7 @@ pub fn is_released(version: &Version) -> Result<bool, String> {
 }
 
 /// Returns the branch a prepared release is proposed from.
-fn release_branch(version: &Version) -> String {
+pub fn release_branch(version: &Version) -> String {
     format!("release/{version}")
 }
 
@@ -62,6 +62,7 @@ pub fn start_release(approval: &SignedApproval) -> Result<(), String> {
 }
 
 /// The repository that `gh` works on, as `touchgate approve` needs it.
+#[derive(Clone)]
 pub struct Repository {
     /// As `owner/name`.
     pub name: String,
@@ -134,40 +135,93 @@ impl GitHubRelease {
     }
 }
 
-/// Commits the prepared release on its branch, pushes it, and opens a pull
-/// request for it, or updates the one that is open. `changelog` is the
-/// changelog's path in the repository, and `registries` where the release
-/// publishes to.
+/// Who commits a prepared release.
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(feature = "tui"),
+    expect(
+        dead_code,
+        reason = "only the interactive touchgate commits as the checkout"
+    )
+)]
+pub enum CommitAuthor {
+    /// The GitHub Actions bot, without hooks, in the `touchgate` workflow.
+    ActionsBot,
+    /// The identity that the checkout's git configuration names, with its
+    /// hooks and its signing, on a person's machine.
+    Checkout,
+}
+
+impl CommitAuthor {
+    /// Returns the arguments of `git` that commit everything changed in the
+    /// checkout with `message`.
+    fn commit_args(self, message: &str) -> Vec<&str> {
+        let mut args = match self {
+            Self::ActionsBot => vec![
+                "-c",
+                "user.name=github-actions[bot]",
+                "-c",
+                "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+                "commit",
+                "--no-verify",
+            ],
+            Self::Checkout => vec!["commit"],
+        };
+        args.extend(["--all", "--message", message]);
+        args
+    }
+}
+
+/// What [`pull_request`] did.
+#[cfg_attr(
+    not(feature = "tui"),
+    expect(
+        dead_code,
+        reason = "only the interactive touchgate reads the URL of an updated pull request"
+    )
+)]
+pub enum PullRequestOutcome {
+    /// Nothing in the checkout changed, so there was nothing to propose.
+    NoChange,
+    /// It opened a pull request, at this URL.
+    Opened(String),
+    /// It updated the pull request that was open, at this URL.
+    Updated(String),
+}
+
+/// Commits the prepared release on its branch as `author`, pushes it, and
+/// opens a pull request for it, or updates the one that is open. `changelog`
+/// is the changelog's path in the repository, and `registries` where the
+/// release publishes to.
+///
+/// As [`CommitAuthor::Checkout`], it replaces a local release branch left
+/// from an earlier try, and switches back to the branch it started on.
 pub fn pull_request(
     version: &Version,
     preparation: Preparation,
     changelog: &str,
     registries: &[Registry],
-) -> Result<(), String> {
+    author: CommitAuthor,
+) -> Result<PullRequestOutcome, String> {
     let release = GitHubRelease::of(version, changelog)?;
     if git(&["status", "--porcelain"])?.is_empty() {
-        println!("{version} needs no change: approve the default branch with `touchgate approve`");
-        return Ok(());
+        return Ok(PullRequestOutcome::NoChange);
     }
     let branch = release_branch(version);
-    git(&["switch", "--create", &branch])?;
-    git(&[
-        "-c",
-        "user.name=github-actions[bot]",
-        "-c",
-        "user.email=41898282+github-actions[bot]@users.noreply.github.com",
-        "commit",
-        "--all",
-        "--no-verify",
-        "--message",
-        &preparation.commit_message(version),
-    ])?;
+    match author {
+        CommitAuthor::ActionsBot => git(&["switch", "--create", &branch])?,
+        CommitAuthor::Checkout => git(&["switch", "--force-create", &branch])?,
+    };
+    git(&author.commit_args(&preparation.commit_message(version)))?;
     git(&[
         "push",
         "--force",
         "origin",
         &format!("HEAD:refs/heads/{branch}"),
     ])?;
+    if let CommitAuthor::Checkout = author {
+        git(&["switch", "-"])?;
+    }
 
     let body = format!(
         "Prepares the release of {version} to {registry}.
@@ -190,12 +244,40 @@ touchgate approve
     match gh(&[
         "pr", "create", "--head", &branch, "--title", &title, "--body", &body,
     ]) {
-        Ok(url) => println!("{url}"),
+        Ok(url) => Ok(PullRequestOutcome::Opened(url.trim_end().to_owned())),
         Err(_) => {
             gh(&["pr", "edit", &branch, "--title", &title, "--body", &body])?;
+            let url = gh(&["pr", "view", &branch, "--json", "url", "--jq", ".url"])?;
+            Ok(PullRequestOutcome::Updated(url.trim_end().to_owned()))
         }
     }
+}
+
+/// Commits the prepared release as the checkout's identity, and pushes it to
+/// `branch` on origin, the default branch.
+#[cfg(feature = "tui")]
+pub fn push_release(
+    version: &Version,
+    preparation: Preparation,
+    branch: &str,
+) -> Result<(), String> {
+    git(&CommitAuthor::Checkout.commit_args(&preparation.commit_message(version)))?;
+    git(&["push", "origin", &format!("HEAD:refs/heads/{branch}")])?;
     Ok(())
+}
+
+/// Returns whether a ruleset lets changes reach `branch` only through pull
+/// requests. Branch protection rules, which only an admin can read, are not
+/// asked.
+#[cfg(feature = "tui")]
+pub fn requires_pull_request(branch: &str) -> Result<bool, String> {
+    let rules = gh(&[
+        "api",
+        &format!("repos/{{owner}}/{{repo}}/rules/branches/{branch}"),
+        "--jq",
+        "[.[] | select(.type == \"pull_request\")] | length",
+    ])?;
+    Ok(rules.trim() != "0")
 }
 
 /// Tags `commit` and makes its GitHub release, as [`GitHubRelease::of`]

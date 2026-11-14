@@ -16,14 +16,16 @@ pep440_rs = "0.7.3"
 serde_json = "1.0.151"
 # Edits manifests without losing their formatting or comments.
 toml_edit = "0.25.15"
-# The terminal of `touchgate release`, an experimental interactive release.
+# The terminal of the interactive `touchgate`, an experimental release in the
+# terminal.
 rustix = { version = "1.1.6", default-features = false, features = ["std", "termios"], optional = true }
 # The width of text in that terminal.
 unicode-width = { version = "0.2.3", optional = true }
 
 [features]
-# `touchgate release`, which approves a release and follows its run in the
-# terminal. Experimental, and left out of the binaries that CI builds.
+# `touchgate` without a command, which prepares, approves and follows a
+# release in the terminal. Experimental, and left out of the binaries that CI
+# builds.
 tui = ["dep:rustix", "dep:unicode-width"]
 
 [lints.rust]
