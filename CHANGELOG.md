@@ -4,7 +4,7 @@
 
 ### Added
 
-- `touchgate` without a command, an experimental release in the terminal, in a build with `--features tui`. In a repository with entries under `## Unreleased`, it prepares the version you pick in a temporary worktree of the default branch as origin has it, whatever your checkout is on, and pushes it to the default branch, or opens its pull request and follows the checks until you merge it. It then shows the commits since the last release, signs the approval when you press `a`, starts `release.yml` and follows the run. It sends a desktop notification through the terminal when it waits on you, and when the run ends. It takes vim keys.
+- `touchgate` without a command, an experimental release in the terminal, in a build with `--features tui`. In a repository with entries under `## Unreleased`, it prepares the version you pick in a temporary worktree of the default branch as origin has it, whatever your checkout is on, and pushes it to the default branch, or opens its pull request and follows the checks until you merge it. It then shows the commits since the last release, signs the approval when you press `a`, starts `release.yml` and follows the run. It sends a desktop notification through the terminal when it waits on you, and when the run ends. It takes vim keys, links what has a page on GitHub, and times jobs and checks as GitHub Actions does.
 
 ## 0.3.0 - 2026-11-14
 

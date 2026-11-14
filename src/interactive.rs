@@ -25,8 +25,9 @@ use crate::github::{self, CommitAuthor, PullRequestOutcome, Repository};
 use crate::project::Project;
 use crate::terminal::{Key, Line, RawTerminal, Span, Style, TabProgress, wrap_to_width};
 use crate::version::{Date, Version, VersionPart};
-use crate::watch::{self, Progress, PullRequestState, PullRequestView, RunView, Watched};
-use crate::{Changes, ReleasePlan};
+use crate::watch::{self, Progress, PullRequestState, PullRequestView, RunView, Timing, Watched};
+use crate::{ChangedCommit, Changes, ReleasePlan};
+use unicode_width::UnicodeWidthStr;
 
 /// The frames of the spinner of something under way.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -191,6 +192,8 @@ impl Drop for Worktree {
 struct Merging {
     version: Version,
     url: String,
+    /// When touchgate opened the pull request, in seconds since the Unix epoch.
+    opened: i64,
     /// The updates on the pull request, until following stops.
     updates: Option<Receiver<Watched<PullRequestView>>>,
     /// The pull request when last asked.
@@ -218,6 +221,8 @@ struct Reviewing {
 /// An approved release whose run is followed.
 struct Following {
     plan: ReleasePlan,
+    /// When touchgate started the release, in seconds since the Unix epoch.
+    started: i64,
     /// The updates on the run, until following stops.
     updates: Option<Receiver<Watched<RunView>>>,
     /// The run when last asked, once it has appeared.
@@ -426,7 +431,9 @@ impl Screen {
                 terminal.notify(&title, &body).map_err(failed)?;
             }
             let (columns, rows) = terminal.size();
-            terminal.draw(&self.lines(columns, rows)).map_err(failed)?;
+            terminal
+                .draw(&self.lines(columns, rows, now()))
+                .map_err(failed)?;
             terminal
                 .show_progress(self.tab_progress())
                 .map_err(failed)?;
@@ -472,7 +479,7 @@ impl Screen {
             Stage::Reviewing(reviewing) => {
                 let page = rows.saturating_sub(REVIEW_CHROME).max(1);
                 let half = page.div_ceil(2);
-                let last = reviewing.changes.log.lines().count().saturating_sub(page);
+                let last = reviewing.changes.commits.len().saturating_sub(page);
                 let scroll = reviewing.scroll;
                 reviewing.scroll = match pressed {
                     Key::Char('a') | Key::Enter => return Response::Approve,
@@ -513,6 +520,7 @@ impl Screen {
                 self.stage = Stage::Merging(Merging {
                     version,
                     url,
+                    opened: now(),
                     updates: Some(receiver),
                     view: None,
                     problem: None,
@@ -597,6 +605,7 @@ impl Screen {
             Ok(updates) => {
                 self.stage = Stage::Following(Following {
                     plan: reviewing.plan.clone(),
+                    started: now(),
                     updates: Some(updates),
                     run: None,
                     problem: None,
@@ -706,17 +715,20 @@ impl Screen {
         }
     }
 
-    /// Returns the lines of a screen of `columns` by `rows`.
-    fn lines(&self, columns: usize, rows: usize) -> Vec<Line> {
+    /// Returns the lines of a screen of `columns` by `rows` at the time `now`,
+    /// in seconds since the Unix epoch.
+    fn lines(&self, columns: usize, rows: usize, now: i64) -> Vec<Line> {
         let mut lines = vec![
             vec![
-                Span::styled("touchgate", Style::Bold),
-                Span::styled(format!("  {}", self.repository.name), Style::Dim),
+                Span::styled("touchgate  ", Style::Bold),
+                Span::styled(self.repository.name.clone(), Style::Dim)
+                    .linked(self.repository.url.clone()),
             ],
             vec![],
         ];
         let spinner = SPINNER[self.tick % SPINNER.len()];
-        let default = &self.repository.default_branch;
+        let repository = &self.repository;
+        let default = &repository.default_branch;
         match &self.stage {
             Stage::Blocked(reason) => {
                 push_wrapped(&mut lines, reason, Style::Failed, columns);
@@ -725,7 +737,8 @@ impl Screen {
             }
             Stage::Released(version) => {
                 lines.push(vec![
-                    Span::styled(version.to_string(), Style::Accent),
+                    Span::styled(version.to_string(), Style::Accent)
+                        .linked(release_page(repository, version)),
                     Span::plain(format!(
                         " is released, and nothing is under ## Unreleased on origin/{default}."
                     )),
@@ -734,11 +747,15 @@ impl Screen {
                 lines.push(footer(&[("r", "look again"), ("q", "quit")]));
             }
             Stage::Preparing(preparing) => {
-                preparing_lines(&mut lines, preparing, default, columns, rows)
+                preparing_lines(&mut lines, preparing, repository, columns, rows)
             }
-            Stage::Merging(merging) => merging_lines(&mut lines, merging, spinner),
-            Stage::Reviewing(reviewing) => reviewing_lines(&mut lines, reviewing, columns, rows),
-            Stage::Following(following) => following_lines(&mut lines, following, spinner),
+            Stage::Merging(merging) => merging_lines(&mut lines, merging, spinner, now),
+            Stage::Reviewing(reviewing) => {
+                reviewing_lines(&mut lines, reviewing, repository, columns, rows)
+            }
+            Stage::Following(following) => {
+                following_lines(&mut lines, following, repository, spinner, now)
+            }
         }
         lines
     }
@@ -877,18 +894,72 @@ fn footer(keys: &[(&str, &str)]) -> Line {
     line
 }
 
-/// Returns the line that names the release of `version`, and the day the
-/// changelog dates it if it does.
-fn release_line(version: &Version, date: Option<Date>) -> Line {
+/// Returns the URL of `path` among the GitHub pages of `repository`, such
+/// as `commit/<hash>`.
+fn page(repository: &Repository, path: &str) -> String {
+    format!("{}/{path}", repository.url)
+}
+
+/// Returns the URL of the GitHub release of `version`.
+fn release_page(repository: &Repository, version: &Version) -> String {
+    page(
+        repository,
+        &format!("releases/tag/{}", github::release_tag(version)),
+    )
+}
+
+/// Returns the URL of the changelog of `repository` at `revision`, a commit
+/// or a branch.
+fn changelog_page(repository: &Repository, revision: &str) -> String {
+    page(repository, &format!("blob/{revision}/CHANGELOG.md"))
+}
+
+/// Returns a commit `subject` as spans, with each `#<number>` linked to that
+/// issue or pull request of `repository`. GitHub sends the URL of an issue to
+/// the pull request of that number.
+fn subject_spans(subject: &str, repository: &Repository) -> Vec<Span> {
+    let bytes = subject.as_bytes();
+    let is_word = |at: usize| bytes.get(at).is_some_and(u8::is_ascii_alphanumeric);
+    let mut spans = Vec::new();
+    let (mut plain, mut at) = (0, 0);
+    while at < bytes.len() {
+        let digits = bytes[at + 1..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        let end = at + 1 + digits;
+        let starts = at == 0 || !is_word(at - 1);
+        if bytes[at] == b'#' && starts && digits > 0 && !is_word(end) {
+            if plain < at {
+                spans.push(Span::plain(&subject[plain..at]));
+            }
+            let number = &subject[at + 1..end];
+            spans.push(
+                Span::styled(&subject[at..end], Style::Accent)
+                    .linked(page(repository, &format!("issues/{number}"))),
+            );
+            (plain, at) = (end, end);
+        } else {
+            at += 1;
+        }
+    }
+    if plain < subject.len() {
+        spans.push(Span::plain(&subject[plain..]));
+    }
+    spans
+}
+
+/// Returns the line that names the release of `version`. With `dated`, it
+/// also names the day the changelog dates it, and links the changelog to
+/// that URL.
+fn release_line(version: &Version, dated: Option<(Date, String)>) -> Line {
     let mut line = vec![
         Span::plain("Release   "),
         Span::styled(version.to_string(), Style::Accent),
     ];
-    if let Some(date) = date {
-        line.push(Span::styled(
-            format!("  dated {date} in CHANGELOG.md"),
-            Style::Dim,
-        ));
+    if let Some((date, changelog)) = dated {
+        line.push(Span::styled(format!("  dated {date} in "), Style::Dim));
+        line.push(Span::styled("CHANGELOG.md", Style::Dim).linked(changelog));
     }
     line
 }
@@ -896,19 +967,25 @@ fn release_line(version: &Version, date: Option<Date>) -> Line {
 fn preparing_lines(
     lines: &mut Vec<Line>,
     preparing: &Preparing,
-    default: &str,
+    repository: &Repository,
     columns: usize,
     rows: usize,
 ) {
+    let default = &repository.default_branch;
     let room = rows.saturating_sub(PREPARE_CHROME + preparing.pick.choices.len());
-    lines.push(vec![Span::styled(
-        if preparing.unreleased.is_empty() {
-            "Nothing is under ## Unreleased."
-        } else {
-            "Unreleased"
-        },
-        Style::Bold,
-    )]);
+    lines.push(vec![
+        Span::styled(
+            if preparing.unreleased.is_empty() {
+                "Nothing is under ## Unreleased"
+            } else {
+                "Unreleased"
+            },
+            Style::Bold,
+        ),
+        Span::styled(" in ", Style::Dim),
+        Span::styled("CHANGELOG.md", Style::Dim).linked(changelog_page(repository, default)),
+        Span::styled(format!(" on {default}"), Style::Dim),
+    ]);
     // Entries are wrapped, with their continuation lines indented.
     let mut unreleased = Vec::new();
     for line in &preparing.unreleased {
@@ -972,13 +1049,18 @@ fn preparing_lines(
             format!("a pull request from {}", github::release_branch(version)),
         ),
     ] {
-        if each == preparing.pick.landing {
-            landing.push(Span::styled("● ", Style::Accent));
-            landing.push(Span::styled(text, Style::Bold));
+        let (mark, style) = if each == preparing.pick.landing {
+            (Span::styled("● ", Style::Accent), Style::Bold)
         } else {
-            landing.push(Span::styled("○ ", Style::Dim));
-            landing.push(Span::plain(text));
-        }
+            (Span::styled("○ ", Style::Dim), Style::Plain)
+        };
+        landing.push(mark);
+        landing.push(match each {
+            Landing::Push => {
+                Span::styled(text, style).linked(page(repository, &format!("tree/{default}")))
+            }
+            Landing::PullRequest => Span::styled(text, style),
+        });
         landing.push(Span::plain("   "));
     }
     lines.push(landing);
@@ -995,7 +1077,7 @@ fn preparing_lines(
     lines.push(footer(&keys));
 }
 
-fn merging_lines(lines: &mut Vec<Line>, merging: &Merging, spinner: &'static str) {
+fn merging_lines(lines: &mut Vec<Line>, merging: &Merging, spinner: &'static str, now: i64) {
     lines.push(release_line(&merging.version, None));
     let view = merging.view.as_ref();
     lines.push(vec![
@@ -1010,14 +1092,18 @@ fn merging_lines(lines: &mut Vec<Line>, merging: &Merging, spinner: &'static str
         .linked(merging.url.clone()),
     ]);
     lines.push(vec![]);
-    for check in view.iter().flat_map(|view| &view.checks) {
-        lines.push(vec![
-            Span::plain("  "),
-            progress_mark(&check.progress, spinner),
-            Span::plain(" "),
-            Span::plain(check.name.clone()).linked(check.url.clone()),
-        ]);
-    }
+    let checks: Vec<TaskRow> = view
+        .iter()
+        .flat_map(|view| &view.checks)
+        .map(|check| TaskRow {
+            name: &check.name,
+            url: &check.url,
+            progress: &check.progress,
+            step: None,
+            timing: check.timing,
+        })
+        .collect();
+    lines.extend(task_lines(&checks, spinner, now));
     if view.is_some_and(|view| !view.checks.is_empty()) {
         lines.push(vec![]);
     }
@@ -1030,14 +1116,12 @@ fn merging_lines(lines: &mut Vec<Line>, merging: &Merging, spinner: &'static str
             "● Ready to merge. Merge it on GitHub in any way, and touchgate goes on.",
             Style::Accent,
         )],
-        Some(_) => vec![
-            Span::styled(spinner, Style::Running),
-            Span::plain(" Waiting for the checks"),
-        ],
-        None => vec![
-            Span::styled(spinner, Style::Running),
-            Span::plain(" Asking GitHub about the pull request"),
-        ],
+        Some(_) => waiting(spinner, "Waiting for the checks", now - merging.opened),
+        None => waiting(
+            spinner,
+            "Asking GitHub about the pull request",
+            now - merging.opened,
+        ),
     });
     if let Some(problem) = &merging.problem {
         lines.push(vec![Span::styled(problem.replace('\n', " "), Style::Dim)]);
@@ -1046,46 +1130,78 @@ fn merging_lines(lines: &mut Vec<Line>, merging: &Merging, spinner: &'static str
     lines.push(footer(&[("q", "quit; the pull request stays open")]));
 }
 
-fn reviewing_lines(lines: &mut Vec<Line>, reviewing: &Reviewing, columns: usize, rows: usize) {
+fn reviewing_lines(
+    lines: &mut Vec<Line>,
+    reviewing: &Reviewing,
+    repository: &Repository,
+    columns: usize,
+    rows: usize,
+) {
     let plan = &reviewing.plan;
     let changes = &reviewing.changes;
-    lines.push(release_line(&plan.version, Some(plan.date)));
+    let commit_page = |hash: &str| page(repository, &format!("commit/{hash}"));
+    lines.push(release_line(
+        &plan.version,
+        Some((plan.date, changelog_page(repository, &plan.commit))),
+    ));
     lines.push(vec![
         Span::plain("Commit    "),
-        Span::styled(plan.commit.clone(), Style::Accent),
+        Span::styled(plan.commit.clone(), Style::Accent).linked(commit_page(&plan.commit)),
     ]);
     lines.push(vec![
         Span::plain("Runs from "),
-        Span::plain("publish at "),
-        Span::styled(plan.workflow_commit.clone(), Style::Accent),
+        Span::plain("publish").linked(page(repository, "tree/publish")),
+        Span::plain(" at "),
+        Span::styled(plan.workflow_commit.clone(), Style::Accent)
+            .linked(commit_page(&plan.workflow_commit)),
     ]);
     lines.push(vec![]);
-    let count = changes.log.lines().count();
+    let count = changes.commits.len();
+    let commits = format!(
+        "{count} commit{}, newest first",
+        if count == 1 { "" } else { "s" }
+    );
     lines.push(match &changes.previous {
         Some(tag) => vec![
-            Span::styled(
-                format!(
-                    "Since {tag}: {count} commit{}",
-                    if count == 1 { "" } else { "s" }
-                ),
-                Style::Bold,
-            ),
-            Span::styled(format!("  {}", changes.shortstat.trim()), Style::Dim),
+            Span::styled("Since ", Style::Bold),
+            Span::styled(tag.clone(), Style::Bold)
+                .linked(page(repository, &format!("releases/tag/{tag}"))),
+            Span::styled(format!(": {commits}  "), Style::Bold),
+            Span::styled(changes.shortstat.trim().to_owned(), Style::Dim).linked(page(
+                repository,
+                &format!("compare/{tag}...{}", plan.commit),
+            )),
         ],
         None => vec![Span::styled(
-            "No release is tagged before this commit. Its last commits:",
+            format!("No release is tagged before this commit. The last {commits}:"),
             Style::Bold,
         )],
     });
-    let page = rows.saturating_sub(REVIEW_CHROME).max(1);
-    for line in changes.log.lines().skip(reviewing.scroll).take(page) {
-        let (hash, subject) = line.split_once(' ').unwrap_or((line, ""));
-        lines.push(vec![
+    let page_rows = rows.saturating_sub(REVIEW_CHROME).max(1);
+    let shown: Vec<&ChangedCommit> = changes
+        .commits
+        .iter()
+        .skip(reviewing.scroll)
+        .take(page_rows)
+        .collect();
+    let age_width = shown
+        .iter()
+        .map(|commit| commit.age.len())
+        .max()
+        .unwrap_or(0);
+    for commit in shown {
+        let mut line = vec![
             Span::plain("  "),
-            Span::styled(hash.to_owned(), Style::Accent),
-            Span::plain(format!(" {subject}")),
-        ]);
+            Span::styled(commit.short.clone(), Style::Accent).linked(commit_page(&commit.hash)),
+            Span::styled(format!("  {:<age_width$}  ", commit.age), Style::Dim),
+        ];
+        line.extend(subject_spans(&commit.subject, repository));
+        if commit.hash == plan.commit {
+            line.push(Span::styled("  ← the commit to release", Style::Dim));
+        }
+        lines.push(line);
     }
+    let page = page_rows;
     lines.push(vec![]);
     if reviewing.stale_date {
         let text = format!(
@@ -1114,7 +1230,13 @@ fn reviewing_lines(lines: &mut Vec<Line>, reviewing: &Reviewing, columns: usize,
     lines.push(footer(&keys));
 }
 
-fn following_lines(lines: &mut Vec<Line>, following: &Following, spinner: &'static str) {
+fn following_lines(
+    lines: &mut Vec<Line>,
+    following: &Following,
+    repository: &Repository,
+    spinner: &'static str,
+    now: i64,
+) {
     let run = following.run.as_ref();
     lines.push(release_line(&following.plan.version, None));
     lines.push(match run {
@@ -1128,29 +1250,38 @@ fn following_lines(lines: &mut Vec<Line>, following: &Following, spinner: &'stat
         ],
     });
     lines.push(vec![]);
-    for job in run.iter().flat_map(|run| &run.jobs) {
-        let mut line = vec![
-            Span::plain("  "),
-            progress_mark(&job.progress, spinner),
-            Span::plain(" "),
-            Span::plain(job.name.clone()).linked(job.url.clone()),
-        ];
-        if let Some(step) = &job.step {
-            line.push(Span::styled(format!("  {step}"), Style::Dim));
-        }
-        lines.push(line);
-    }
+    let jobs: Vec<TaskRow> = run
+        .iter()
+        .flat_map(|run| &run.jobs)
+        .map(|job| TaskRow {
+            name: &job.name,
+            url: &job.url,
+            progress: &job.progress,
+            step: job.step.as_deref(),
+            timing: job.timing,
+        })
+        .collect();
+    lines.extend(task_lines(&jobs, spinner, now));
+    // How long the run took, or has taken so far, as GitHub times it.
+    let took = run
+        .and_then(|run| run.timing.elapsed(now))
+        .unwrap_or(now - following.started);
     if run.is_some_and(|run| !run.jobs.is_empty()) {
         lines.push(vec![]);
     }
     let version = &following.plan.version;
     lines.push(match run.map(|run| &run.progress) {
-        Some(Progress::Passed) => vec![Span::styled(
-            format!("✓ Released {version}."),
-            Style::Passed,
-        )],
+        Some(Progress::Passed) => vec![
+            Span::styled("✓ Released ", Style::Passed),
+            Span::styled(version.to_string(), Style::Passed)
+                .linked(release_page(repository, version)),
+            Span::styled(format!(" in {}.", format_elapsed(took)), Style::Passed),
+        ],
         Some(Progress::Failed(conclusion)) => vec![Span::styled(
-            format!("✗ The release run ended with {conclusion}."),
+            format!(
+                "✗ The release run ended with {conclusion} after {}.",
+                format_elapsed(took)
+            ),
             Style::Failed,
         )],
         Some(Progress::Skipped) => {
@@ -1159,18 +1290,9 @@ fn following_lines(lines: &mut Vec<Line>, following: &Following, spinner: &'stat
         _ if following.updates.is_none() => {
             vec![Span::styled("Following the run stopped.", Style::Failed)]
         }
-        Some(Progress::Running) => vec![
-            Span::styled(spinner, Style::Running),
-            Span::plain(" Running"),
-        ],
-        Some(Progress::Queued) => vec![
-            Span::styled(spinner, Style::Running),
-            Span::plain(" Queued"),
-        ],
-        None => vec![
-            Span::styled(spinner, Style::Running),
-            Span::plain(" Waiting for the run to appear"),
-        ],
+        Some(Progress::Running) => waiting(spinner, "Running", took),
+        Some(Progress::Queued) => waiting(spinner, "Queued", took),
+        None => waiting(spinner, "Waiting for the run to appear", took),
     });
     if let Some(problem) = &following.problem {
         lines.push(vec![Span::styled(problem.replace('\n', " "), Style::Dim)]);
@@ -1185,6 +1307,67 @@ fn following_lines(lines: &mut Vec<Line>, following: &Following, spinner: &'stat
             "quit; the run goes on without touchgate"
         },
     )]));
+}
+
+/// Returns the time in seconds since the Unix epoch, for the timers.
+fn now() -> i64 {
+    crate::unix_time().unwrap_or_default()
+}
+
+/// Returns `seconds` as GitHub Actions writes a duration, such as `45s`,
+/// `1m 4s` or `2h 5m`.
+fn format_elapsed(seconds: i64) -> String {
+    match seconds {
+        ..60 => format!("{seconds}s"),
+        60..3_600 => format!("{}m {}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {}m", seconds / 3_600, seconds % 3_600 / 60),
+    }
+}
+
+/// A job of the run or a check on the pull request, as a row of the screen.
+struct TaskRow<'a> {
+    name: &'a str,
+    url: &'a str,
+    progress: &'a Progress,
+    /// The step it is at, for a job that runs.
+    step: Option<&'a str>,
+    timing: Timing,
+}
+
+/// Returns the lines of `rows` at the time `now`: each mark and name, then
+/// how long it ran, in one column, then its step.
+fn task_lines(rows: &[TaskRow], spinner: &'static str, now: i64) -> Vec<Line> {
+    let name_width = rows.iter().map(|row| row.name.width()).max().unwrap_or(0);
+    rows.iter()
+        .map(|row| {
+            let elapsed = row
+                .timing
+                .elapsed(now)
+                .map(format_elapsed)
+                .unwrap_or_default();
+            let padding = name_width - row.name.width() + 2;
+            let mut line = vec![
+                Span::plain("  "),
+                progress_mark(row.progress, spinner),
+                Span::plain(" "),
+                Span::plain(row.name).linked(row.url),
+                Span::styled(format!("{:padding$}{elapsed:>7}", ""), Style::Dim),
+            ];
+            if let Some(step) = row.step {
+                line.push(Span::styled(format!("  {step}"), Style::Dim));
+            }
+            line
+        })
+        .collect()
+}
+
+/// Returns a line of a spinner, `text` and how long it has taken.
+fn waiting(spinner: &'static str, text: &str, elapsed: i64) -> Line {
+    vec![
+        Span::styled(spinner, Style::Running),
+        Span::plain(format!(" {text}  ")),
+        Span::styled(format_elapsed(elapsed), Style::Dim),
+    ]
 }
 
 /// Returns the mark of the `progress` of a job or a check, with `spinner` for
@@ -1210,13 +1393,19 @@ mod tests {
         choices[suggested].version.to_string()
     }
 
+    /// Returns a repository that releases from main.
+    fn repository() -> Repository {
+        Repository {
+            name: "o/r".to_owned(),
+            default_branch: "main".to_owned(),
+            url: "https://github.com/o/r".to_owned(),
+        }
+    }
+
     /// Returns a screen at `stage` for a repository that releases from main.
     fn screen_at(stage: Stage) -> Screen {
         Screen {
-            repository: Repository {
-                name: "o/r".to_owned(),
-                default_branch: "main".to_owned(),
-            },
+            repository: repository(),
             key: PathBuf::from("key"),
             stage,
             tick: 0,
@@ -1249,7 +1438,14 @@ mod tests {
 
     #[test]
     fn scrolls_the_commits_with_vim_keys() {
-        let log: String = (0..40).map(|n| format!("{n:07x} Commit {n}.\n")).collect();
+        let commits = (0..40)
+            .map(|n| ChangedCommit {
+                hash: format!("{n:040x}"),
+                short: format!("{n:07x}"),
+                age: format!("{n} hours ago"),
+                subject: format!("Commit {n}."),
+            })
+            .collect();
         let mut screen = screen_at(Stage::Reviewing(Reviewing {
             plan: ReleasePlan {
                 repository: "o/r".to_owned(),
@@ -1260,7 +1456,7 @@ mod tests {
             },
             changes: Changes {
                 previous: None,
-                log,
+                commits,
                 shortstat: String::new(),
             },
             scroll: 0,
@@ -1290,6 +1486,37 @@ mod tests {
             Response::Approve
         ));
         assert!(matches!(screen.respond(Key::Char('q'), 24), Response::Quit));
+    }
+
+    #[test]
+    fn links_the_issues_a_subject_names() {
+        let spans = subject_spans(
+            "Merge pull request #11, after #2 but not a#3 or #4b",
+            &repository(),
+        );
+        let parts: Vec<_> = spans
+            .iter()
+            .map(|span| (span.text.as_str(), span.link.as_deref()))
+            .collect();
+        assert_eq!(
+            parts,
+            [
+                ("Merge pull request ", None),
+                ("#11", Some("https://github.com/o/r/issues/11")),
+                (", after ", None),
+                ("#2", Some("https://github.com/o/r/issues/2")),
+                (" but not a#3 or #4b", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn writes_durations_as_github_does() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(59), "59s");
+        assert_eq!(format_elapsed(64), "1m 4s");
+        assert_eq!(format_elapsed(3_599), "59m 59s");
+        assert_eq!(format_elapsed(7_500), "2h 5m");
     }
 
     #[test]

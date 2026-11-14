@@ -498,6 +498,7 @@ fn approve(args: &[&str]) -> Result<(), Vec<String>> {
     let key = signing_key(key)?;
     let repository = github::Repository::of_checkout().map_err(|error| vec![error])?;
     fetch_release_refs(&repository)?;
+    let url = repository.url.clone();
     let plan = ReleasePlan::of(repository, revision)?;
     let approval = plan.approval_at(unix_time()?)?;
 
@@ -511,7 +512,7 @@ fn approve(args: &[&str]) -> Result<(), Vec<String>> {
         github::start_release(&signed).map_err(|error| vec![error])?;
         println!(
             "Started release.yml on publish. Follow it with `gh run watch`, or at {}/actions",
-            github::repository_url().map_err(|error| vec![error])?
+            url
         );
         Ok(())
     } else {
@@ -638,9 +639,9 @@ fn unix_time() -> Result<i64, Vec<String>> {
 struct Changes {
     /// The tag of that release, if one is tagged before the commit.
     previous: Option<String>,
-    /// `git log --oneline` of the commits since that release, or of the last
-    /// 20 commits if there is none.
-    log: String,
+    /// The commits since that release, or the last 20 if there is none,
+    /// newest first.
+    commits: Vec<ChangedCommit>,
     /// `git diff --shortstat` since that release, or nothing if there is none.
     shortstat: String,
 }
@@ -660,29 +661,65 @@ impl Changes {
             .map(|tag| tag.trim_end().to_owned());
         match previous {
             Some(tag) => {
-                let range = format!("{tag}..{commit}");
-                let log =
-                    run(Command::new("git").args(["log", "--oneline", "--no-decorate", &range]))?;
+                let commits = ChangedCommit::log(&[&format!("{tag}..{commit}")])?;
                 let shortstat =
                     run(Command::new("git").args(["diff", "--shortstat", &tag, commit]))?;
                 Ok(Self {
                     previous: Some(tag),
-                    log,
+                    commits,
                     shortstat,
                 })
             }
             None => Ok(Self {
                 previous: None,
-                log: run(Command::new("git").args([
-                    "log",
-                    "--oneline",
-                    "--no-decorate",
-                    "-20",
-                    commit,
-                ]))?,
+                commits: ChangedCommit::log(&["-20", commit])?,
                 shortstat: String::new(),
             }),
         }
+    }
+}
+
+/// A commit in [`Changes`].
+#[cfg_attr(
+    not(feature = "tui"),
+    expect(
+        dead_code,
+        reason = "only the interactive touchgate shows the age and links the hash"
+    )
+)]
+struct ChangedCommit {
+    /// The full hash.
+    hash: String,
+    /// The hash as `git log --oneline` abbreviates it.
+    short: String,
+    /// How long ago it was committed, as git says it, such as `3 hours ago`.
+    age: String,
+    /// The subject line of its message.
+    subject: String,
+}
+
+/// The separator of the fields that [`ChangedCommit::log`] asks git for.
+const FIELD_SEPARATOR: char = '\u{1f}';
+
+impl ChangedCommit {
+    /// Returns the commits that `git log` lists with `args`, newest first.
+    fn log(args: &[&str]) -> Result<Vec<Self>, Vec<String>> {
+        let text = run(Command::new("git")
+            .args(["log", "--no-decorate", "--format=%H%x1f%h%x1f%cr%x1f%s"])
+            .args(args))?;
+        Ok(text.lines().filter_map(Self::parse).collect())
+    }
+
+    /// Reads a line as [`ChangedCommit::log`] asks git to write it.
+    fn parse(line: &str) -> Option<Self> {
+        let mut fields = line.splitn(4, FIELD_SEPARATOR);
+        let mut field = || fields.next().map(str::to_owned);
+        Some(Self {
+            hash: field()?,
+            short: field()?,
+            age: field()?,
+            subject: field()?,
+        })
     }
 }
 
@@ -693,7 +730,10 @@ fn show_changes(changes: &Changes, commit: &str) {
         Some(tag) => eprintln!("Since {tag}:"),
         None => eprintln!("No release is tagged before {commit}. Its last commits:"),
     }
-    eprint!("{}{}", changes.log, changes.shortstat);
+    for commit in &changes.commits {
+        eprintln!("{} {}", commit.short, commit.subject);
+    }
+    eprint!("{}", changes.shortstat);
 }
 
 /// Publishes what the project releases to a registry, skipping what is there

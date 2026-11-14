@@ -213,6 +213,21 @@ impl Date {
         Self::of_unix_time(seconds as i64)
     }
 
+    /// Returns the number of days from 1970-01-01 to this date, which is
+    /// negative for a date before it.
+    #[cfg(feature = "tui")]
+    pub fn days_since_epoch(self) -> i64 {
+        // Howard Hinnant's `days_from_civil`, the inverse of the conversion
+        // in `of_unix_time`.
+        let (month, day) = (i64::from(self.month), i64::from(self.day));
+        let year = i64::from(self.year) - i64::from(month <= 2);
+        let era = year.div_euclid(400);
+        let yoe = year.rem_euclid(400);
+        let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
     /// Returns the UTC date of a time in seconds since the Unix epoch.
     pub fn of_unix_time(seconds: i64) -> Self {
         // Howard Hinnant's `civil_from_days`, for days since 1970-01-01.

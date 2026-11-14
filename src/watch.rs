@@ -62,6 +62,48 @@ impl Progress {
     }
 }
 
+/// When a run, a job or a check started and finished, in seconds since the
+/// Unix epoch.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Timing {
+    pub started: Option<i64>,
+    pub completed: Option<i64>,
+}
+
+impl Timing {
+    /// Reads the GitHub times `started` and `completed`.
+    fn of(started: &str, completed: &str) -> Self {
+        Self {
+            started: parse_time(started),
+            completed: parse_time(completed),
+        }
+    }
+
+    /// Returns how long it ran, up to `now` if it has not finished. Returns
+    /// `None` if it has not started.
+    pub fn elapsed(&self, now: i64) -> Option<i64> {
+        let started = self.started?;
+        Some((self.completed.unwrap_or(now) - started).max(0))
+    }
+}
+
+/// Reads a time as GitHub writes it, such as `2026-11-14T12:39:02Z`, in
+/// seconds since the Unix epoch. Returns `None` for anything else, and for
+/// the time GitHub gives what has not happened, `0001-01-01T00:00:00Z`.
+fn parse_time(text: &str) -> Option<i64> {
+    let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
+    let days = crate::version::Date::parse(date).ok()?.days_since_epoch();
+    let time = time.split('.').next()?;
+    let mut parts = time.split(':').map(|part| part.parse::<i64>().ok());
+    let (Some(Some(hours)), Some(Some(minutes)), Some(Some(seconds)), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let unix = days * 86_400 + hours * 3_600 + minutes * 60 + seconds;
+    (unix >= 0).then_some(unix)
+}
+
 /// What a follower sends.
 pub enum Watched<T> {
     /// How the followed thing is, when last asked.
@@ -104,6 +146,7 @@ pub struct JobView {
     /// The step the job is at, while it runs.
     pub step: Option<String>,
     pub url: String,
+    pub timing: Timing,
 }
 
 /// How the release run is going.
@@ -112,6 +155,8 @@ pub struct RunView {
     pub url: String,
     pub progress: Progress,
     pub jobs: Vec<JobView>,
+    /// When the run started, and when GitHub last changed it once it is done.
+    pub timing: Timing,
 }
 
 /// Returns the IDs of the latest runs of `release.yml` that a person started
@@ -194,7 +239,7 @@ fn view_run(id: u64) -> Result<RunView, String> {
         "view",
         &id.to_string(),
         "--json",
-        "url,status,conclusion,jobs",
+        "url,status,conclusion,jobs,startedAt,updatedAt",
     ])?;
     parse_run_view(&json)
 }
@@ -204,7 +249,8 @@ fn text(value: &serde_json::Value, name: &str) -> String {
     value[name].as_str().unwrap_or_default().to_owned()
 }
 
-/// Reads the output of `gh run view --json url,status,conclusion,jobs`.
+/// Reads the output of `gh run view --json
+/// url,status,conclusion,jobs,startedAt,updatedAt`.
 fn parse_run_view(json: &str) -> Result<RunView, String> {
     let run: serde_json::Value =
         serde_json::from_str(json).map_err(|error| format!("gh run view: {error}"))?;
@@ -229,13 +275,21 @@ fn parse_run_view(json: &str) -> Result<RunView, String> {
                 progress,
                 step,
                 url: text(job, "url"),
+                timing: Timing::of(&text(job, "startedAt"), &text(job, "completedAt")),
             }
         })
         .collect();
+    let progress = Progress::of(&text(&run, "status"), &text(&run, "conclusion"));
+    let completed = if progress.is_done() {
+        text(&run, "updatedAt")
+    } else {
+        String::new()
+    };
     Ok(RunView {
         url: text(&run, "url"),
-        progress: Progress::of(&text(&run, "status"), &text(&run, "conclusion")),
+        progress,
         jobs,
+        timing: Timing::of(&text(&run, "startedAt"), &completed),
     })
 }
 
@@ -253,6 +307,8 @@ pub struct CheckView {
     pub name: String,
     pub progress: Progress,
     pub url: String,
+    /// When the check ran. An older commit status has no times.
+    pub timing: Timing,
 }
 
 /// How the release pull request is going.
@@ -331,11 +387,13 @@ fn parse_pull_request_view(json: &str) -> Result<PullRequestView, String> {
                 name: text(check, "context"),
                 progress: Progress::of_status(&text(check, "state")),
                 url: text(check, "targetUrl"),
+                timing: Timing::default(),
             },
             _ => CheckView {
                 name: text(check, "name"),
                 progress: Progress::of(&text(check, "status"), &text(check, "conclusion")),
                 url: text(check, "detailsUrl"),
+                timing: Timing::of(&text(check, "startedAt"), &text(check, "completedAt")),
             },
         })
         .collect();
@@ -355,6 +413,20 @@ fn parse_pull_request_view(json: &str) -> Result<PullRequestView, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_github_times() {
+        assert_eq!(parse_time("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_time("2026-11-14T12:39:02Z"), Some(1_794_659_942));
+        assert_eq!(parse_time("2024-02-29T23:59:59.5Z"), Some(1_709_251_199));
+        assert_eq!(parse_time("0001-01-01T00:00:00Z"), None);
+        assert_eq!(parse_time(""), None);
+        let running = Timing::of("2026-11-14T12:39:02Z", "0001-01-01T00:00:00Z");
+        assert_eq!(running.elapsed(1_794_659_942 + 75), Some(75));
+        let done = Timing::of("2026-11-14T12:39:02Z", "2026-11-14T12:39:26Z");
+        assert_eq!(done.elapsed(i64::MAX), Some(24));
+        assert_eq!(Timing::default().elapsed(0), None);
+    }
 
     #[test]
     fn finds_the_run_that_was_not_there_before() {

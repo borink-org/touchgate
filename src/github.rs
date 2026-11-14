@@ -68,6 +68,8 @@ pub struct Repository {
     /// As `owner/name`.
     pub name: String,
     pub default_branch: String,
+    /// The URL of its page on GitHub.
+    pub url: String,
 }
 
 impl Repository {
@@ -77,17 +79,20 @@ impl Repository {
             "repo",
             "view",
             "--json",
-            "nameWithOwner,defaultBranchRef",
+            "nameWithOwner,defaultBranchRef,url",
             "--jq",
-            ".nameWithOwner + \" \" + .defaultBranchRef.name",
+            ".nameWithOwner + \" \" + .defaultBranchRef.name + \" \" + .url",
         ])?;
-        let (name, branch) = text
-            .trim_end()
-            .split_once(' ')
-            .ok_or_else(|| format!("gh repo view: `{}`", text.trim_end()))?;
+        let mut fields = text.split_whitespace();
+        let (Some(name), Some(branch), Some(url), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(format!("gh repo view: `{}`", text.trim_end()));
+        };
         Ok(Self {
             name: name.to_owned(),
             default_branch: branch.to_owned(),
+            url: url.to_owned(),
         })
     }
 }
