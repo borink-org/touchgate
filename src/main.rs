@@ -8,8 +8,14 @@ mod actions;
 mod approval;
 mod changelog;
 mod github;
+#[cfg(feature = "tui")]
+mod interactive;
 mod project;
 mod python;
+#[cfg(feature = "tui")]
+mod release_run;
+#[cfg(feature = "tui")]
+mod terminal;
 mod version;
 mod workspace;
 
@@ -36,6 +42,7 @@ usage:
   touchgate check-entry <base revision>
   touchgate notes [<version>]
   touchgate approve [<commit>] [--key <private key>] [--no-start]
+  touchgate release [<commit>] [--key <private key>]
   touchgate verify [--repo <dir>] [--approval <file>] [--branch <ref>]
                    [--repository <owner/name>] [--key <public key>]
                    [--workflow-commit <hash>] [--max-age <15m | 1h | 7d>]
@@ -47,7 +54,10 @@ usage:
 In a release run of GitHub Actions, the release commands read the approval
 from the run's `approval` input. verify takes --branch and --repository from
 the run, --key from TOUCHGATE_KEY and --workflow-commit from
-GITHUB_WORKFLOW_SHA.";
+GITHUB_WORKFLOW_SHA.
+
+touchgate release approves in the terminal and follows the release run. It
+is experimental, and only in a build with `--features tui`.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -62,6 +72,8 @@ fn main() -> ExitCode {
         ["verify", rest @ ..] => verify(rest),
         ["publish", rest @ ..] => publish(rest),
         ["approve", rest @ ..] => approve(rest),
+        #[cfg(feature = "tui")]
+        ["release", rest @ ..] => interactive::release(rest),
         ["github-release", "--commit", commit, files @ ..] => github_release(commit, files),
         ["github-release", files @ ..] => github_release_of_run(files),
         ["wait-for-checks", rest @ ..] => wait_for_checks(rest),
@@ -435,123 +447,200 @@ const DEFAULT_KEY: &str = "~/.ssh/id_ed25519_sk_signing";
 /// Nothing from the commit runs: the version comes from its changelog, read
 /// with git, since running `cargo` would run code not yet approved.
 fn approve(args: &[&str]) -> Result<(), Vec<String>> {
-    let (mut key, mut revision, mut start) = (DEFAULT_KEY.to_owned(), None, true);
+    let (mut key, mut revision, mut start) = (DEFAULT_KEY, None, true);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match *arg {
-            "--key" => key = (*args.next().ok_or_else(|| vec![USAGE.to_owned()])?).to_owned(),
+            "--key" => key = *args.next().ok_or_else(|| vec![USAGE.to_owned()])?,
             "--no-start" => start = false,
             flag if flag.starts_with('-') => return Err(vec![USAGE.to_owned()]),
             commit if revision.is_none() => revision = Some(commit),
             _ => return Err(vec![USAGE.to_owned()]),
         }
     }
-    if let Some(rest) = key.strip_prefix("~/") {
-        let home = std::env::var("HOME").map_err(|_| vec!["HOME is not set".to_owned()])?;
-        key = format!("{home}/{rest}");
-    }
-    if !Path::new(&key).is_file() {
-        return Err(vec![format!("{key}: no such key. Pass the key with --key")]);
-    }
+    let key = signing_key(key)?;
+    let plan = ReleasePlan::of(revision)?;
+    let approval = plan.approval_at(unix_time()?)?;
 
-    let repository = github::Repository::of_checkout().map_err(|error| vec![error])?;
-    let default = &repository.default_branch;
-    let tracking = format!("refs/remotes/origin/{default}");
-    // The release is to run from publish as it is now; a change to it after
-    // this stops the release until it is approved again.
-    run(Command::new("git").args([
-        "fetch",
-        "--quiet",
-        "--tags",
-        "origin",
-        &format!("+refs/heads/{default}:{tracking}"),
-        "+refs/heads/publish:refs/remotes/origin/publish",
-    ]))?;
-    let commit = run(Command::new("git").args([
-        "rev-parse",
-        "--verify",
-        "--end-of-options",
-        &format!("{}^{{commit}}", revision.unwrap_or(&tracking)),
-    ]))?;
-    let commit = commit.trim_end();
-    let workflow_commit = run(Command::new("git").args([
-        "rev-parse",
-        "--verify",
-        "refs/remotes/origin/publish^{commit}",
-    ]))?;
-    let workflow_commit = workflow_commit.trim_end();
-    let (version, date) = approval::approvable_release(Path::new("."), commit, &tracking)
-        .map_err(|error| vec![error])?;
-    let time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| vec![error.to_string()])?
-        .as_secs() as i64;
-    approval::check_release_date(&version, date, time).map_err(|error| vec![error])?;
-
-    show_changes(commit)?;
+    show_changes(&Changes::since_release(&approval.commit)?, &approval.commit);
     eprintln!(
-        "Approving release {version} of {} at {commit}, to run from publish at \
-         {workflow_commit}.",
-        repository.name
+        "Approving release {} of {} at {}, to run from publish at {}.",
+        approval.version, approval.repository, approval.commit, approval.workflow_commit
     );
-    let signed = approval::Approval {
-        repository: repository.name,
-        commit: commit.to_owned(),
-        version,
-        workflow_commit: workflow_commit.to_owned(),
-        time,
-    }
-    .sign(Path::new(&key))
-    .map_err(|error| vec![error])?;
+    let signed = approval.sign(&key).map_err(|error| vec![error])?;
     if start {
-        github::start_release(&signed).map_err(|error| vec![error])
+        github::start_release(&signed).map_err(|error| vec![error])?;
+        println!(
+            "Started release.yml on publish. Follow it with `gh run watch`, or at {}/actions",
+            github::repository_url().map_err(|error| vec![error])?
+        );
+        Ok(())
     } else {
         print!("{}", signed.text());
         Ok(())
     }
 }
 
-/// Shows on standard error the commits that `commit` adds to the release
-/// tagged last before it, so that the approval covers what the person saw.
-fn show_changes(commit: &str) -> Result<(), Vec<String>> {
-    let previous = Command::new("git")
-        .args(["describe", "--tags", "--abbrev=0", "--match", "v*"])
-        .arg(format!("{commit}^"))
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|error| vec![format!("git: {error}")])?;
-    let previous = String::from_utf8(previous.stdout)
-        .ok()
-        .filter(|_| previous.status.success())
-        .map(|tag| tag.trim_end().to_owned());
-    match previous {
-        Some(tag) => {
-            let range = format!("{tag}..{commit}");
-            eprintln!("Since {tag}:");
-            eprint!(
-                "{}",
-                run(Command::new("git").args(["log", "--oneline", "--no-decorate", &range]))?
-            );
-            eprint!(
-                "{}",
-                run(Command::new("git").args(["diff", "--shortstat", &tag, commit]))?
-            );
+/// Returns the path of the signing key `key`, with a leading `~/` read as the
+/// home directory, and fails if there is no such file.
+fn signing_key(key: &str) -> Result<PathBuf, Vec<String>> {
+    let path = match key.strip_prefix("~/") {
+        Some(rest) => {
+            let home = std::env::var("HOME").map_err(|_| vec!["HOME is not set".to_owned()])?;
+            PathBuf::from(format!("{home}/{rest}"))
         }
-        None => {
-            eprintln!("No release is tagged before {commit}. Its last commits:");
-            eprint!(
-                "{}",
-                run(Command::new("git").args([
+        None => PathBuf::from(key),
+    };
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(vec![format!(
+            "{}: no such key. Pass the key with --key",
+            path.display()
+        )])
+    }
+}
+
+/// What an approval would release, before it is signed: everything an
+/// [`approval::Approval`] names but the time.
+struct ReleasePlan {
+    /// The repository as `owner/name`.
+    repository: String,
+    /// The full hash of the commit to release, on the default branch.
+    commit: String,
+    version: Version,
+    /// The day the changelog dates the release.
+    date: Date,
+    /// The commit of the `publish` branch the release is to run from.
+    workflow_commit: String,
+}
+
+impl ReleasePlan {
+    /// Fetches the default branch and `publish`, and reads the release of
+    /// `revision`, the tip of the default branch unless it names another
+    /// commit on it.
+    fn of(revision: Option<&str>) -> Result<Self, Vec<String>> {
+        let repository = github::Repository::of_checkout().map_err(|error| vec![error])?;
+        let default = &repository.default_branch;
+        let tracking = format!("refs/remotes/origin/{default}");
+        // The release is to run from publish as it is now; a change to it after
+        // this stops the release until it is approved again.
+        run(Command::new("git").args([
+            "fetch",
+            "--quiet",
+            "--tags",
+            "origin",
+            &format!("+refs/heads/{default}:{tracking}"),
+            "+refs/heads/publish:refs/remotes/origin/publish",
+        ]))?;
+        let commit = run(Command::new("git").args([
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{}^{{commit}}", revision.unwrap_or(&tracking)),
+        ]))?;
+        let commit = commit.trim_end().to_owned();
+        let workflow_commit = run(Command::new("git").args([
+            "rev-parse",
+            "--verify",
+            "refs/remotes/origin/publish^{commit}",
+        ]))?;
+        let (version, date) = approval::approvable_release(Path::new("."), &commit, &tracking)
+            .map_err(|error| vec![error])?;
+        Ok(Self {
+            repository: repository.name,
+            commit,
+            version,
+            date,
+            workflow_commit: workflow_commit.trim_end().to_owned(),
+        })
+    }
+
+    /// Returns the approval of the release signed at `time`, in seconds since
+    /// the Unix epoch. Fails if the changelog dates the release another day
+    /// than `time` or the day before.
+    fn approval_at(&self, time: i64) -> Result<approval::Approval, Vec<String>> {
+        approval::check_release_date(&self.version, self.date, time)
+            .map_err(|error| vec![error])?;
+        Ok(approval::Approval {
+            repository: self.repository.clone(),
+            commit: self.commit.clone(),
+            version: self.version.clone(),
+            workflow_commit: self.workflow_commit.clone(),
+            time,
+        })
+    }
+}
+
+/// Returns the time in seconds since the Unix epoch.
+fn unix_time() -> Result<i64, Vec<String>> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| vec![error.to_string()])?
+        .as_secs() as i64)
+}
+
+/// The commits that a commit adds to the release tagged last before it, as
+/// git prints them.
+struct Changes {
+    /// The tag of that release, if one is tagged before the commit.
+    previous: Option<String>,
+    /// `git log --oneline` of the commits since that release, or of the last
+    /// 20 commits if there is none.
+    log: String,
+    /// `git diff --shortstat` since that release, or nothing if there is none.
+    shortstat: String,
+}
+
+impl Changes {
+    /// Reads the changes that `commit` adds to the release tagged before it.
+    fn since_release(commit: &str) -> Result<Self, Vec<String>> {
+        let previous = Command::new("git")
+            .args(["describe", "--tags", "--abbrev=0", "--match", "v*"])
+            .arg(format!("{commit}^"))
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|error| vec![format!("git: {error}")])?;
+        let previous = String::from_utf8(previous.stdout)
+            .ok()
+            .filter(|_| previous.status.success())
+            .map(|tag| tag.trim_end().to_owned());
+        match previous {
+            Some(tag) => {
+                let range = format!("{tag}..{commit}");
+                let log =
+                    run(Command::new("git").args(["log", "--oneline", "--no-decorate", &range]))?;
+                let shortstat =
+                    run(Command::new("git").args(["diff", "--shortstat", &tag, commit]))?;
+                Ok(Self {
+                    previous: Some(tag),
+                    log,
+                    shortstat,
+                })
+            }
+            None => Ok(Self {
+                previous: None,
+                log: run(Command::new("git").args([
                     "log",
                     "--oneline",
                     "--no-decorate",
                     "-20",
-                    commit
-                ]))?
-            );
+                    commit,
+                ]))?,
+                shortstat: String::new(),
+            }),
         }
     }
-    Ok(())
+}
+
+/// Shows the `changes` that `commit` adds on standard error, so that the
+/// approval covers what the person saw.
+fn show_changes(changes: &Changes, commit: &str) {
+    match &changes.previous {
+        Some(tag) => eprintln!("Since {tag}:"),
+        None => eprintln!("No release is tagged before {commit}. Its last commits:"),
+    }
+    eprint!("{}{}", changes.log, changes.shortstat);
 }
 
 /// Publishes what the project releases to a registry, skipping what is there

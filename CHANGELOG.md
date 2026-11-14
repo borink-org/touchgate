@@ -6,6 +6,7 @@
 
 - Releases of several packages from one repository at one version: the members of a uv workspace, listed in a root `pyproject.toml` without `[project]`, to PyPI, and the published packages of the Cargo workspace at the root to crates.io. `touchgate prepare` moves pinned requirements between the members along. `examples/workspace-release.yml` publishes from one job per registry.
 - `touchgate publish --to crates.io` and `--to pypi`, which name the registry. A repository that publishes to both must name it.
+- `touchgate release`, an experimental interactive `touchgate approve` in a build with `--features tui`. It shows the release and the commits since the last one, signs the approval when you press `a`, starts `release.yml` and shows the run's jobs until the run ends. It takes the same `<commit>` and `--key` as `touchgate approve`.
 
 ## 0.2.0 - 2026-11-01
 

@@ -58,10 +58,6 @@ pub fn start_release(approval: &SignedApproval) -> Result<(), String> {
         "--raw-field",
         &format!("approval={}", approval.text()),
     ])?;
-    println!(
-        "Started release.yml on publish. Follow it with `gh run watch`, or at {}/actions",
-        repository_url()?
-    );
     Ok(())
 }
 
@@ -95,7 +91,7 @@ impl Repository {
 }
 
 /// Returns the URL of the repository on GitHub.
-fn repository_url() -> Result<String, String> {
+pub fn repository_url() -> Result<String, String> {
     gh(&["repo", "view", "--json", "url", "--jq", ".url"]).map(|url| url.trim_end().to_owned())
 }
 
@@ -392,7 +388,7 @@ fn tagged_commit(tag: &str) -> Result<Option<String>, String> {
 /// Runs `gh`, and returns its standard output, or its standard error as the
 /// error. In GitHub Actions, `gh` works on the repository of the run unless
 /// `GH_REPO` names another, also in a job without a checkout.
-fn gh(args: &[&str]) -> Result<String, String> {
+pub fn gh(args: &[&str]) -> Result<String, String> {
     let mut command = Command::new("gh");
     if std::env::var_os("GH_REPO").is_none()
         && let Some(repository) = std::env::var_os("GITHUB_REPOSITORY")
